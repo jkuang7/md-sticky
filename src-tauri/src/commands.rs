@@ -1,13 +1,16 @@
 use anyhow::Context;
-use tauri::Manager;
+use tauri::{Manager};
 
 use crate::{
-    save_load::{save_sticky, Note},
-    windows::close_sticky,
+    save_load::{Note, save_sticky}, settings::MenuSettings, windows::close_sticky
 };
 
 #[tauri::command]
-pub fn bring_all_to_front(window: tauri::Window) -> Result<(), String> {
+pub fn bring_all_to_front(window: tauri::Window, settings: tauri::State<MenuSettings>) -> Result<(), String> {
+    if !settings.bring_to_front().map_err(|e| e.to_string())? {
+        return Ok(())
+    }
+
     window.webview_windows().iter().for_each(|(_, w)| {
         #[cfg(target_os = "macos")]
         {

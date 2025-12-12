@@ -1,24 +1,22 @@
-use tauri::App;
+use tauri::{App, Manager};
 use tauri_plugin_log::log::{self, LevelFilter};
 use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
-
 use crate::commands::*;
 use crate::menu::{create_menu, handle_menu_event};
-use crate::save_load::load_stickies;
+use crate::save_load::{load_settings, load_stickies};
 
 mod commands;
 mod menu;
 mod save_load;
 mod windows;
+mod settings;
 
 fn setup(app: &mut App) -> Result<(), Box<(dyn std::error::Error)>> {
     load_stickies(app.handle())?;
 
-    let menu = create_menu(app.handle())?;
-    app.set_menu(menu)?;
-    app.on_menu_event(handle_menu_event);
+    let menu_settings = load_settings(app.handle())?;
 
     let autostart_manager = app.autolaunch();
     if !cfg!(debug_assertions) {
@@ -28,13 +26,23 @@ fn setup(app: &mut App) -> Result<(), Box<(dyn std::error::Error)>> {
             update(handle).await.unwrap();
         });
 
-        if !autostart_manager.is_enabled()? {
-            autostart_manager.enable()?;
+        if !autostart_manager.is_enabled()?{
+            if menu_settings.autostart()? {
+                autostart_manager.enable()?;
+            } else {
+                autostart_manager.disable()?;
+            }
         }
     } else {
         autostart_manager.disable()?;
     }
     log::info!("registered for autostart? {}", autostart_manager.is_enabled()?);
+
+    app.manage(menu_settings);
+
+    let menu = create_menu(app.handle())?;
+    app.set_menu(menu)?;
+    app.on_menu_event(handle_menu_event);
 
     Ok(())
 }
