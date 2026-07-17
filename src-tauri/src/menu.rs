@@ -1,18 +1,23 @@
-use anyhow::{Context};
+use anyhow::Context;
 use tauri::menu::{
-    Menu, MenuBuilder, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder
+    Menu, MenuBuilder, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
-use tauri::{AppHandle, Emitter, Manager, Wry};
+use tauri::{AppHandle, Manager, Wry};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_log::log;
 
 use crate::save_load::save_settings;
 use crate::settings::MenuSettings;
-use crate::windows::{close_sticky, create_sticky, cycle_focus, fit_text, reset_note_positions, set_color, snap_window, Direction};
+use crate::windows::{
+    create_sticky, cycle_focus, fit_text, request_close_sticky, reset_note_positions,
+    restore_last_closed, set_color, snap_window, Direction,
+};
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
 pub enum MenuCommand {
     NewNote,
     CloseNote,
+    ReopenClosedNote,
     ResetPositions,
     FitText,
     NextNote,
@@ -24,9 +29,9 @@ pub enum MenuCommand {
     AutoStart,
 }
 
-impl Into<MenuId> for MenuCommand {
-    fn into(self) -> MenuId {
-        MenuId(serde_json::to_string(&self).expect("Could not serialize MenuCommand enum"))
+impl From<MenuCommand> for MenuId {
+    fn from(command: MenuCommand) -> Self {
+        MenuId(serde_json::to_string(&command).expect("Could not serialize MenuCommand enum"))
     }
 }
 
@@ -53,8 +58,21 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
                 true,
                 Some("Cmd+W"),
             )?,
+            &MenuItem::with_id(
+                app,
+                MenuCommand::ReopenClosedNote,
+                "Reopen Last Closed Note",
+                true,
+                Some("Cmd+Shift+T"),
+            )?,
             &MenuItem::with_id(app, MenuCommand::NewNote, "New Note", true, Some("Cmd+N"))?,
-            &MenuItem::with_id(app, MenuCommand::ResetPositions, "Reset Note Positions", true, None::<&str>)?
+            &MenuItem::with_id(
+                app,
+                MenuCommand::ResetPositions,
+                "Reset Note Positions",
+                true,
+                None::<&str>,
+            )?,
         ])
         .separator()
         .items(&[
@@ -74,10 +92,7 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
             )?,
         ])
         .separator()
-        .items(&[
-            &settings.bring_to_front,
-            &settings.autostart,
-        ])
+        .items(&[&settings.bring_to_front, &settings.autostart])
         .build()?;
 
     Ok(menu)
@@ -171,12 +186,12 @@ fn create_edit_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error> {
         ])
         .separator()
         .item(&MenuItem::with_id(
-                app,
-                MenuCommand::FitText,
-                "Resize Note to Text",
-                true,
-                Some("Cmd+F"),
-            )?,)
+            app,
+            MenuCommand::FitText,
+            "Resize Note to Text",
+            true,
+            Some("Cmd+F"),
+        )?)
         .build()?;
 
     Ok(menu)
@@ -185,55 +200,13 @@ fn create_edit_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error> {
 fn create_color_menu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error> {
     let menu = SubmenuBuilder::new(app, "Color")
         .items(&[
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(0),
-                "Color 1",
-                true,
-                Some("Cmd+1"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(1),
-                "Color 2",
-                true,
-                Some("Cmd+2"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(2),
-                "Color 3",
-                true,
-                Some("Cmd+3"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(3),
-                "Color 4",
-                true,
-                Some("Cmd+4"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(4),
-                "Color 5",
-                true,
-                Some("Cmd+5"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(5),
-                "Color 6",
-                true,
-                Some("Cmd+6"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                MenuCommand::Color(6),
-                "Color 7",
-                true,
-                Some("Cmd+7"),
-            )?,
+            &MenuItem::with_id(app, MenuCommand::Color(0), "Color 1", true, Some("Cmd+1"))?,
+            &MenuItem::with_id(app, MenuCommand::Color(1), "Color 2", true, Some("Cmd+2"))?,
+            &MenuItem::with_id(app, MenuCommand::Color(2), "Color 3", true, Some("Cmd+3"))?,
+            &MenuItem::with_id(app, MenuCommand::Color(3), "Color 4", true, Some("Cmd+4"))?,
+            &MenuItem::with_id(app, MenuCommand::Color(4), "Color 5", true, Some("Cmd+5"))?,
+            &MenuItem::with_id(app, MenuCommand::Color(5), "Color 6", true, Some("Cmd+6"))?,
+            &MenuItem::with_id(app, MenuCommand::Color(6), "Color 7", true, Some("Cmd+7"))?,
         ])
         .build()?;
 
@@ -258,31 +231,63 @@ pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
     match MenuCommand::try_from(event.id) {
         Ok(command) => {
             if let Err(e) = match command {
-                MenuCommand::NewNote => create_sticky(app, None).map(|_| ()),
+                MenuCommand::NewNote => create_sticky(app).map(|_| ()),
                 MenuCommand::ResetPositions => reset_note_positions(app),
                 MenuCommand::Snap(direction) => snap_window(app, direction, false),
                 MenuCommand::PartialSnap(direction) => snap_window(app, direction, true),
-                MenuCommand::CloseNote => close_sticky(app),
+                MenuCommand::CloseNote => request_close_sticky(app),
+                MenuCommand::ReopenClosedNote => restore_last_closed(app),
                 MenuCommand::NextNote => cycle_focus(app, false),
                 MenuCommand::PrevNote => cycle_focus(app, true),
                 MenuCommand::FitText => fit_text(app),
-                MenuCommand::Color(index) => set_color(app, index), 
+                MenuCommand::Color(index) => set_color(app, index),
                 MenuCommand::BringToFront => save_settings(app),
-                MenuCommand::AutoStart => save_settings(app),
+                MenuCommand::AutoStart => apply_autostart_preference(app),
                 // _ => Err(anyhow::anyhow!("unimplemented command: {:?}", command)),
             } {
                 log::error!("Error executing command: {:?} : {:#}", command, e);
-            };
-            if let 
-                MenuCommand::NewNote |
-                MenuCommand::CloseNote |
-                MenuCommand::Color(_) 
-            = command {
-                _ = app.emit("save_request", {});
             };
         }
         Err(e) => {
             log::warn!("{:#}", e)
         }
     };
+}
+
+fn apply_autostart_preference(app: &AppHandle) -> anyhow::Result<()> {
+    let settings = app.state::<MenuSettings>();
+    let desired = settings.autostart()?;
+    let previous = !desired;
+
+    if cfg!(debug_assertions) {
+        settings.autostart.set_checked(false)?;
+        anyhow::bail!("Development builds cannot be added to login items");
+    }
+
+    let manager = app.autolaunch();
+    let apply = if desired {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+
+    if let Err(error) = apply {
+        settings.autostart.set_checked(previous)?;
+        return Err(error.into());
+    }
+
+    if let Err(error) = save_settings(app) {
+        let rollback = if previous {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
+        settings.autostart.set_checked(previous)?;
+        if let Err(rollback_error) = rollback {
+            log::error!("Could not roll back login-item state: {rollback_error}");
+        }
+        return Err(error);
+    }
+
+    Ok(())
 }

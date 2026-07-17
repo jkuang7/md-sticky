@@ -1,111 +1,161 @@
 <script lang="ts">
-    import { onMount } from "svelte";
-    import Quill, { Delta } from "quill";
-    // @ts-expect-error
-    import QuillMarkdown from "quilljs-markdown";
-    import "quill/dist/quill.bubble.css";
-    import { webviewWindow } from "@tauri-apps/api";
-    import { LogicalSize } from "@tauri-apps/api/dpi";
-    import { listen } from "@tauri-apps/api/event";
-    import { invoke } from "@tauri-apps/api/core";
+  import { Editor, type JSONContent } from "@tiptap/core";
+  import { LogicalSize } from "@tauri-apps/api/dpi";
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { webviewWindow } from "@tauri-apps/api";
+  import { onDestroy, onMount } from "svelte";
 
-    const appWindow = webviewWindow.getCurrentWebviewWindow();
+  import { createEditorExtensions } from "./editorExtensions";
 
-    let quill: undefined | Quill = $state();
-    let saveTimeout: null | number = null;
+  interface StickyInit {
+    document: JSONContent;
+    color: string;
+  }
 
-    export async function save_contents() {
-        if (saveTimeout) {
-            clearTimeout(saveTimeout)
-        }
-        saveTimeout = setTimeout(async () => {
-            if (quill) {
-                await invoke("save_contents", {
-                    contents: JSON.stringify(quill.getContents()),
-                    color: document.body.style.backgroundColor,
-                });
-            }
-        }, 300);
+  let { onTitleChange = () => undefined }: {
+    onTitleChange?: (title: string) => void;
+  } = $props();
+
+  const appWindow = webviewWindow.getCurrentWebviewWindow();
+
+  let element: HTMLDivElement;
+  let editor: Editor | undefined;
+  let saveTimeout: number | undefined;
+  let saveChain: Promise<void> = Promise.resolve();
+  const unlisteners: UnlistenFn[] = [];
+
+  function currentTitle(): string {
+    if (!editor) return "Empty Note";
+    const text = editor.state.doc.textBetween(
+      0,
+      editor.state.doc.content.size,
+      "\n",
+    );
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean) ?? "Empty Note";
+  }
+
+  async function growToFit() {
+    const editable = element.querySelector<HTMLElement>(".tiptap");
+    if (!editable) return;
+
+    const factor = await appWindow.scaleFactor();
+    const windowSize = (await appWindow.innerSize()).toLogical(factor);
+    const requiredHeight = editable.scrollHeight + 24;
+
+    if (requiredHeight > windowSize.height) {
+      await appWindow.setSize(
+        new LogicalSize(windowSize.width, requiredHeight),
+      );
     }
+  }
 
-    export function remove_selection() {
-        quill?.setSelection(null)
+  function queueSave(delay = 2_000) {
+    if (saveTimeout !== undefined) window.clearTimeout(saveTimeout);
+    saveTimeout = window.setTimeout(() => void flushSave(), delay);
+  }
+
+  export async function flushSave() {
+    if (saveTimeout !== undefined) {
+      window.clearTimeout(saveTimeout);
+      saveTimeout = undefined;
     }
+    if (!editor) return;
 
-    onMount(async () => {
-        quill = new Quill("#editor", {
-            theme: "bubble",
-            placeholder: "Empty Note",
-            modules: {
-                toolbar: false,
-            },
+    const snapshot = editor.getJSON();
+    const color = document.body.style.backgroundColor;
+    const save = saveChain
+      .catch(() => undefined)
+      .then(async () => {
+        await invoke("save_note", {
+          document: snapshot,
+          color,
         });
+      });
+    saveChain = save;
+    await save;
+  }
 
-        // @ts-expect-error
-        let init = window.__STICKY_INIT__ as
-            | undefined
-            | { contents: string; color: string };
-        if (init) {
-            quill.setContents(JSON.parse(init.contents));
-            document.body.style.backgroundColor = init.color;
-        } else {
-            document.body.style.backgroundColor = "#fff9b1";
-        }
+  export function removeSelection() {
+    editor?.commands.blur();
+  }
 
-        let timeout: undefined | number = $state();
-        function debounceChangeEvent() {
-            clearTimeout(timeout);
-            timeout = setTimeout(save_contents, 2000);
-        }
+  export function focus() {
+    editor?.commands.focus();
+  }
 
-        quill.on("text-change", async () => {
-            debounceChangeEvent();
+  onMount(async () => {
+    const init = (window as typeof window & { __STICKY_INIT__?: StickyInit })
+      .__STICKY_INIT__;
 
-            let editor = document.querySelector(".ql-editor");
-
-            const factor = await appWindow.scaleFactor();
-
-            const windowSize = (await appWindow.innerSize()).toLogical(factor);
-
-            if (editor!.clientHeight > windowSize.height) {
-                appWindow.setSize(
-                    new LogicalSize(windowSize.width, editor!.clientHeight),
-                );
+    editor = new Editor({
+      element,
+      extensions: createEditorExtensions(),
+      content: init?.document ?? { type: "doc", content: [{ type: "paragraph" }] },
+      editorProps: {
+        handleDOMEvents: {
+          focusin: (view, event) => {
+            const target = event.target;
+            if (
+              !(target instanceof HTMLInputElement) ||
+              target.type !== "checkbox"
+            ) {
+              return false;
             }
-        });
-
-        // remove color and background color formatting
-        quill.clipboard.matchers.splice(5, 1)
-
-        new QuillMarkdown(quill, {});
-
-        requestAnimationFrame(() => quill?.focus());
-
-        appWindow.listen("fit_text", async () => {
-            let editor = document.querySelector(".ql-editor") as HTMLElement;
-
-            editor.style.minHeight = "fit-content";
-
-            const factor = await appWindow.scaleFactor();
-            const windowSize = (await appWindow.outerSize()).toLogical(factor);
-
-            requestAnimationFrame(async () => {
-                appWindow.setSize(
-                    new LogicalSize(windowSize.width, editor!.clientHeight),
-                );
-                editor.style.minHeight = "100vh";
-            });
-        });
-
-        listen("save_request", save_contents);
+            view.focus();
+            return true;
+          },
+        },
+      },
+      onUpdate: () => {
+        onTitleChange(currentTitle());
+        queueSave();
+        void growToFit();
+      },
     });
+
+    document.body.style.backgroundColor = init?.color || "#fff9b1";
+    onTitleChange(currentTitle());
+    requestAnimationFrame(() => editor?.commands.focus());
+
+    unlisteners.push(
+      await appWindow.listen("fit_text", async () => {
+        const editable = element.querySelector<HTMLElement>(".tiptap");
+        if (!editable) return;
+        const factor = await appWindow.scaleFactor();
+        const windowSize = (await appWindow.outerSize()).toLogical(factor);
+        await appWindow.setSize(
+          new LogicalSize(windowSize.width, editable.scrollHeight + 24),
+        );
+      }),
+      await listen("save_request", () => flushSave()),
+      await listen("flush_before_quit", async () => {
+        try {
+          await flushSave();
+          await invoke("acknowledge_quit");
+        } catch (error) {
+          console.error("Could not save note before quitting", error);
+        }
+      }),
+    );
+
+  });
+
+  onDestroy(() => {
+    if (saveTimeout !== undefined) window.clearTimeout(saveTimeout);
+    unlisteners.forEach((unlisten) => unlisten());
+    editor?.destroy();
+  });
 </script>
 
-<div id="editor"></div>
+<div class="editor" bind:this={element}></div>
 
 <style>
-    #editor {
-        width: 100%;
-        height: 100%;
-    }
+  .editor {
+    height: 100%;
+    width: 100%;
+  }
 </style>

@@ -1,8 +1,8 @@
 [package]
-name = "md-sticky"
-version = "1.0.13"
-description = "Sticky notes app with markdown support"
-authors = ["Andrew Yurovchak"]
+name = "md-sticky-local"
+version = "2.0.0"
+description = "Private local macOS sticky notes app"
+authors = ["Jian"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "md_sticky_lib"
+name = "md_sticky_local_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -19,20 +19,17 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-log = "2"
 tauri-plugin-store = "2"
 anyhow = "1.0.99"
-chrono = "0.4.42"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.1", default-features = false }
-objc2-app-kit = { version = "0.3.1", default-features = false, features = ["NSWindow"] }
+objc2-app-kit = { version = "0.3.1", default-features = false, features = ["NSApplication", "NSEvent", "NSGraphicsContext", "NSWindow"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2"
-

@@ -1,7 +1,7 @@
 {
-  "name": "md-sticky",
-  "version": "1.0.13",
-  "description": "",
+  "name": "md-sticky-local",
+  "version": "2.0.0",
+  "description": "Private local macOS sticky notes app",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -13,16 +13,13 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@jamescoyle/svg-icon": "^1.0.0",
     "@mdi/js": "^7.4.47",
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-autostart": "^2.5.0",
-    "@tauri-apps/plugin-log": "^2.7.0",
-    "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-store": "^2.4.0",
-    "@tauri-apps/plugin-updater": "^2.9.0",
-    "quill": "^2.0.3",
-    "quilljs-markdown": "^1.2.0"
+    "@tiptap/core": "^3.28.0",
+    "@tiptap/extension-list": "^3.28.0",
+    "@tiptap/extension-placeholder": "^3.28.0",
+    "@tiptap/pm": "^3.28.0",
+    "@tiptap/starter-kit": "^3.28.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
