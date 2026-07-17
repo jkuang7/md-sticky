@@ -1,6 +1,7 @@
 import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { Extension } from "@tiptap/core";
+import { Selection } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
 
 const StickyShortcuts = Extension.create({
@@ -21,16 +22,33 @@ const StickyShortcuts = Extension.create({
         return true;
       },
       "Shift-Tab": () => {
-        if (this.editor.isActive("taskItem")) {
-          this.editor.commands.liftListItem("taskItem");
+        if (
+          this.editor.isActive("taskItem") &&
+          this.editor.commands.liftListItem("taskItem")
+        ) {
           return true;
         }
-        if (this.editor.isActive("listItem")) {
-          this.editor.commands.liftListItem("listItem");
+        if (
+          this.editor.isActive("listItem") &&
+          this.editor.commands.liftListItem("listItem")
+        ) {
           return true;
         }
-        // Keep WebKit from moving keyboard focus into the titlebar controls
-        // once the current item has reached the outermost indentation level.
+
+        const { state, view } = this.editor;
+        const { $from } = state.selection;
+        if ($from.depth > 0) {
+          const previousLine = Selection.findFrom(
+            state.doc.resolve($from.before()),
+            -1,
+            true,
+          );
+          if (previousLine) {
+            view.dispatch(state.tr.setSelection(previousLine).scrollIntoView());
+          }
+        }
+
+        // Always consume the shortcut so WebKit cannot focus titlebar controls.
         return true;
       },
       "Mod-Shift-0": () => this.editor.commands.toggleBulletList(),
