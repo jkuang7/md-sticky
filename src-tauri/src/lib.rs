@@ -16,7 +16,7 @@ mod save_load;
 mod settings;
 mod windows;
 
-fn setup(app: &mut App) -> Result<(), Box<(dyn std::error::Error)>> {
+fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let repository = NoteRepository::load(app.handle())?;
     app.manage(repository);
 

@@ -1,152 +1,128 @@
 # Sticky
 
+A minimal, local-first Markdown sticky-note app for Apple Silicon Macs.
+
 https://github.com/user-attachments/assets/7b61d4fa-8e2a-4b80-af09-37120dd7e8cb
 
-
-## About
-
-A sticky note app inspired by the "stickies" app that comes with MacOS. I found it frustrating that it did not support md syntax, and had a ton of unecessary formatting options.
-
-This app is not tested on windows or linux, so there may be bugs, but I don't forsee any problems getting it to work on either.
+Sticky is a personal fork of the original macOS Stickies-inspired project. This fork focuses on reliable local storage, keyboard-driven note management, linked note stacks, and a straightforward source-based installer.
 
 ## Features
 
-- uses a markdown text editor, compatible with github-markdown syntax (`[ ]` to make checkboxes)
-- customizable colors and a large default color palate
-- minimal and unobtrusive sticky note appearance
-- autosave, notes persist after quitting and reopening the app
-- recoverable note closing with `Cmd + Shift + T` to reopen the last closed note
-- easily move, navigate, resize, and set colors of notes with keyboard shortcuts
-- local-first note storage with atomic snapshots and automatic corrupt-file recovery
+- Markdown editing with task lists and GitHub-style syntax
+- Autosave with notes restored after quitting or restarting the Mac
+- Local-only note storage with atomic snapshots and corrupt-file recovery
+- Custom note colors, pinning, folding, snapping, and linked vertical stacks
+- Recoverable note closing: reopen the last closed note with `Command + Shift + T`
+- Hide or restore all notes with `Command + Shift + H`
+- Keyboard shortcut reference available inside the app with `F1`
 
-## Installation
+## Install on a Mac
 
-These instructions are for Apple Silicon Macs (M1, M2, M3, M4, or newer). You do not need Git or any programming experience. The first installation takes longer because your Mac must build the app from its source code.
-
-### 1. Install the required tools
-
-You only need to do this part once.
-
-#### Install Node.js
-
-1. Go to [nodejs.org](https://nodejs.org/).
-2. Download the **LTS** version for macOS.
-3. Open the downloaded `.pkg` file and keep clicking **Continue**, then click **Install**.
-
-#### Open Terminal
-
-Terminal is an app included with every Mac:
-
-1. Press `Command + Space` to open Spotlight Search.
-2. Type `Terminal`.
-3. Press `Return`.
-
-You will paste a few commands into this window. Paste one command at a time and press `Return` after each one. Do not type the `$` symbol sometimes shown in online examples.
-
-#### Install Apple's build tools
-
-Paste this into Terminal:
+Sticky supports Apple Silicon Macs (M1 or newer) and requires Git. Open **Terminal** and run:
 
 ```sh
-xcode-select --install
+git clone https://github.com/jkuang7/md-sticky.git
+cd md-sticky
+./install.sh
 ```
 
-A window will appear. Click **Install**, accept the agreement, and wait for it to finish. If Terminal says the tools are already installed, continue to the next step.
+The script installs its build tools inside the repository, builds Sticky, installs it in Applications, and opens it. Keep Terminal open; the first run may take several minutes. If macOS asks to install developer tools, accept the installation and rerun the command that stopped.
 
-#### Install Rust
+### If macOS blocks the first launch
 
-Paste this into Terminal:
+Sticky is built locally and is not notarized by Apple. If macOS blocks it:
+
+1. Try to open Sticky once.
+2. Open **System Settings → Privacy & Security**.
+3. Scroll down to **Security**.
+4. Click **Open Anyway** only if you trust this repository.
+
+See Apple's [Open apps safely on your Mac](https://support.apple.com/102445) guidance for more information.
+
+## Update Sticky
+
+If you used the installation commands above, the repository is in your home folder. Open Terminal and run:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cd ~/md-sticky
+git pull --ff-only
+./install.sh
 ```
 
-When asked how to proceed, press `Return` to choose the default installation. When it finishes, quit Terminal and open it again so it can find Rust.
+The installer rebuilds Sticky, safely replaces the app, and reopens it. Updating the app does not replace your notes.
 
-### 2. Download Sticky from GitHub
+## Notes and privacy
 
-1. Return to the main page of this GitHub repository.
-2. Click the green **Code** button near the top of the file list.
-3. Click **Download ZIP**. You do not need to create a GitHub account or install Git.
-4. Open your **Downloads** folder in Finder.
-5. If you see a ZIP file, double-click it. You should now see a folder named something like `md-sticky-main`.
+Sticky has no cloud sync, analytics, release updater, or account system. Notes stay on the Mac at:
 
-### 3. Install Sticky in Applications
+```text
+~/Library/Application Support/local.jian.mdsticky/notes.json
+```
 
-1. Open Terminal again.
-2. Type the following, then press the space bar once. Do not press `Return` yet:
+The last valid snapshot is retained as `notes.previous.json`. If the current file becomes unreadable, Sticky preserves the damaged bytes under `backups/` and restores the previous snapshot when possible.
 
-   ```sh
-   cd
-   ```
+Closing a note with `Command + W` archives it instead of immediately deleting its saved data. Press `Command + Shift + T` to reopen the most recently closed note.
 
-3. Drag the `md-sticky-main` folder from Finder into the Terminal window. Terminal will add the folder's location after `cd `.
-4. Press `Return`.
-5. Paste this command and wait for it to finish:
+## Uninstall
 
-   ```sh
-   npm ci
-   ```
+1. Quit Sticky with `Command + Q`.
+2. Move `/Applications/Sticky.app` to the Trash.
+3. Delete the `md-sticky` repository folder if you no longer need it for updates.
 
-6. Paste this command:
+Your notes remain in the Application Support folder shown above unless you delete that folder separately.
 
-   ```sh
-   npm run install:macos
-   ```
+## Keyboard shortcuts
 
-The first build may take several minutes. Keep Terminal open while it runs. When it is finished, Sticky is installed as `/Applications/Sticky.app` and opens automatically.
+Press `F1` inside Sticky to open the built-in shortcut reference.
 
-Sticky is built locally and is not notarized by Apple. If macOS blocks it, try opening Sticky once, then go to **System Settings → Privacy & Security**, scroll down to **Security**, and click **Open Anyway** only if you trust this repository. Apple explains this warning in [Open apps safely on your Mac](https://support.apple.com/102445).
+| Shortcut | Action |
+|---|---|
+| `Command + Q` | Quit Sticky |
+| `Command + W` | Close the focused note while retaining its saved data |
+| `Command + Shift + T` | Reopen the most recently closed note |
+| `Command + N` | Create a note |
+| `Command + Shift + H` | Hide or restore all notes |
+| `Command + /` | Focus the next note |
+| `Command + Option + /` | Focus the previous note |
+| `Command + Option + Arrow` | Snap the note to the next overlapping edge |
+| `Command + Shift + Option + Arrow` | Snap the note to any nearby edge |
+| `Command + 1–7` | Set the note color |
+| `Command + Shift + 0` | Toggle a bullet list |
+| `Command + Shift + C` | Check or uncheck the current task |
+| `Command + Shift + X` | Delete completed tasks |
+| `Command + Shift + S` | Toggle strikethrough |
+| `Tab` / `Shift + Tab` | Indent or outdent a list item |
+| `F1` | Show or hide the keyboard shortcut reference |
 
-You can delete the downloaded `md-sticky-main` folder after Sticky is installed.
+Standard editing shortcuts such as copy, cut, paste, undo, and redo also work.
 
-### Updating Sticky later
+## Development
 
-1. Quit Sticky by pressing `Command + Q`.
-2. Download a fresh ZIP from GitHub by repeating step 2 above.
-3. Repeat step 3 with the newly downloaded folder.
-
-The installer safely replaces the copy in Applications and reopens it. Your notes are not replaced; they are stored separately at `~/Library/Application Support/local.jian.mdsticky/notes.json`.
-
-### Developer commands
-
-Run these from the downloaded project folder:
+Run `./install.sh` once to create the project-local Node.js and Rust toolchains. In each new Terminal session, enter the repository and expose those tools for development:
 
 ```sh
-# Build the app without installing it
+cd ~/md-sticky
+export CARGO_HOME="$PWD/.tools/cargo"
+export RUSTUP_HOME="$PWD/.tools/rustup"
+export PATH="$PWD/.tools/node/bin:$CARGO_HOME/bin:$PATH"
+```
+
+Useful commands:
+
+```sh
+npm run dev
+npm run check
 npm run app:build
-
-# Check, build, and create an Apple Silicon ZIP in dist/
 npm run package:macos
+npm run install:macos
 ```
 
-## Local fork status
+`npm run package:macos` creates `dist/Sticky-macOS-arm64.zip`. `npm run install:macos` checks, rebuilds, safely replaces the app in Applications, and reopens it.
 
-This repository is a local-first macOS app with bundle identifier `local.jian.mdsticky`. Its updater is disabled, so local builds never contact or install releases from the upstream project's update feed. Release signing and notarization credentials are not configured.
+Architecture and persistence details are documented in [PLOT.md](PLOT.md).
 
-The upstream package metadata declares MIT, but the upstream repository does not currently include a root license file. Clarify the license with the upstream owner before redistributing this fork publicly.
+## Project status and licensing
 
-Notes are stored as Tiptap JSON in a versioned Rust-owned `notes.json`. Each save retains the last valid snapshot as `notes.previous.json`. If the current store is unreadable, exact damaged bytes are preserved under `backups/`, the previous valid snapshot is restored when possible, and the app adds a visible recovery notice note.
+This fork uses bundle identifier `local.jian.mdsticky`. Builds are ad-hoc signed and are not notarized for public distribution.
 
-## App Specific Keyboard shortcuts
-
-Default editor shortcuts (Cmd+X, Cmd+V, Cmd+C) are enabled
-
-| Command                           | Action                                                                                              |
-|-----------------------------------|-----------------------------------------------------------------------------------------------------|
-| `Cmd + Q`                         | Quit the application                                                                                |
-| `Cmd + W`                         | Close the focused note without deleting its saved data                                               |
-| `Cmd + Shift + T`                 | Reopen the most recently closed note                                                                 |
-| `Cmd + N`                         | Create new note                                                                                     |
-| `Cmd + Shift + H`                 | Hide all note windows, or show them again if they are hidden                                        |
-| `Cmd + /`                         | Focus next note                                                                                     |
-| `Cmd + Alt + /`                   | Focus previous note                                                                                 |
-| `Cmd + Alt + <Arrow Key>`         | Snap note (Move window in direction until it aligns with the nearest fully overlapping window edge) |
-| `Cmd + Shift + Alt + <Arrow Key>` | Partially snap note (Move window in direction until it aligns with the nearest window edge)         |
-| `Cmd + <Number>`                  | Set color of note                                                                                   |
-| `Cmd + Shift + 0`                | Toggle a bullet list                                                                                |
-| `Cmd + Shift + C`                | Check or uncheck the current task                                                                   |
-| `Cmd + Shift + X`                | Delete all completed tasks in the focused note                                                      |
-| `Cmd + Shift + S`                | Toggle strikethrough                                                                                |
-| `Tab` / `Shift + Tab`            | Indent or outdent a list item                                                                       |
-| `F1`                              | Show or hide the Keyboard Shortcuts window                                                          |
+The inherited package metadata declares MIT, but the upstream repository does not include a root license file. Confirm the licensing terms with the upstream owner before redistributing compiled builds or source beyond personal testing.
