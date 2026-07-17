@@ -1,7 +1,7 @@
 import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { Extension } from "@tiptap/core";
-import { Selection } from "@tiptap/pm/state";
+import { Selection, TextSelection } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
 
 const StickyShortcuts = Extension.create({
@@ -37,14 +37,45 @@ const StickyShortcuts = Extension.create({
 
         const { state, view } = this.editor;
         const { $from } = state.selection;
-        if ($from.depth > 0) {
+        if (
+          state.selection.empty &&
+          $from.depth === 1 &&
+          $from.parent.isTextblock
+        ) {
           const previousLine = Selection.findFrom(
             state.doc.resolve($from.before()),
             -1,
             true,
           );
           if (previousLine) {
-            view.dispatch(state.tr.setSelection(previousLine).scrollIntoView());
+            const currentContent = state.doc.slice(
+              $from.start(),
+              $from.end(),
+            ).content;
+            const previousEnd = previousLine.$from.end();
+            const needsSpace =
+              previousLine.$from.parent.textContent.length > 0 &&
+              $from.parent.textContent.length > 0 &&
+              !/\s$/.test(previousLine.$from.parent.textContent) &&
+              !/^\s/.test($from.parent.textContent);
+            const transaction = state.tr.delete(
+              $from.before(),
+              $from.after(),
+            );
+            let insertionEnd = previousEnd;
+            if (needsSpace) {
+              transaction.insertText(" ", insertionEnd);
+              insertionEnd += 1;
+            }
+            transaction.insert(insertionEnd, currentContent);
+            insertionEnd += currentContent.size;
+            view.dispatch(
+              transaction
+                .setSelection(
+                  TextSelection.create(transaction.doc, insertionEnd),
+                )
+                .scrollIntoView(),
+            );
           }
         }
 
