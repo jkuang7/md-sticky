@@ -1,11 +1,18 @@
 <script lang="ts">
-  import { mdiClose, mdiPalette, mdiPin, mdiPinOff } from "@mdi/js";
+  import {
+    mdiClose,
+    mdiLinkVariant,
+    mdiPalette,
+    mdiPin,
+    mdiPinOff,
+  } from "@mdi/js";
   import { invoke } from "@tauri-apps/api/core";
   import { webviewWindow } from "@tauri-apps/api";
   import { onDestroy, onMount } from "svelte";
 
   import Editor from "$lib/Editor.svelte";
   import Icon from "$lib/Icon.svelte";
+  import ShortcutsHelp from "$lib/ShortcutsHelp.svelte";
 
   interface StickyInit {
     always_on_top?: boolean;
@@ -22,34 +29,48 @@
     "#b98cb3",
   ];
   const appWindow = webviewWindow.getCurrentWebviewWindow();
+  const shortcutsWindow = Boolean(
+    (window as typeof window & { __SHORTCUTS__?: boolean }).__SHORTCUTS__,
+  );
 
-  let editor: Editor;
+  let editor = $state<Editor>();
   let colorMenuOpen = $state(false);
   let titlebarHovered = $state(false);
   let alwaysOnTop = $state(false);
   let collapsed = $state(false);
+  let stackBusy = $state(false);
   let noteTitle = $state("Empty Note");
   let moveTimer: number | undefined;
   const unlisteners: Array<() => void> = [];
 
   async function toggleAlwaysOnTop() {
-    await editor.flushSave();
+    await editor?.flushSave();
     alwaysOnTop = !alwaysOnTop;
     await invoke("set_note_always_on_top", { alwaysOnTop });
   }
 
+  async function resetVerticalStack() {
+    if (stackBusy) return;
+    stackBusy = true;
+    try {
+      await invoke("reset_vertical_stack");
+    } finally {
+      stackBusy = false;
+    }
+  }
+
   async function closeNote() {
-    await editor.flushSave();
+    await editor?.flushSave();
     await invoke("close_window");
   }
 
   async function toggleCollapsed() {
-    await editor.flushSave();
+    await editor?.flushSave();
     const next = !collapsed;
     await invoke("set_collapsed", { collapsed: next });
     collapsed = next;
     colorMenuOpen = false;
-    if (!collapsed) requestAnimationFrame(() => editor.focus());
+    if (!collapsed) requestAnimationFrame(() => editor?.focus());
   }
 
   function toggleColorMenu() {
@@ -59,12 +80,16 @@
   async function setColor(color: string) {
     document.body.style.backgroundColor = color;
     colorMenuOpen = false;
-    await editor.flushSave();
+    await editor?.flushSave();
   }
 
   function saveGeometryDebounced() {
     if (moveTimer !== undefined) window.clearTimeout(moveTimer);
     moveTimer = window.setTimeout(() => void editor?.flushSave(), 150);
+  }
+
+  function finishWindowDrag() {
+    void invoke("finish_window_drag");
   }
 
   function createNoteWithControlN(event: KeyboardEvent) {
@@ -82,6 +107,7 @@
   }
 
   onMount(async () => {
+    if (shortcutsWindow) return;
     const init = (window as typeof window & { __STICKY_INIT__?: StickyInit })
       .__STICKY_INIT__;
     alwaysOnTop = init?.always_on_top ?? false;
@@ -89,6 +115,7 @@
 
     if (!init) document.body.classList.add("focused");
     window.addEventListener("keydown", createNoteWithControlN, true);
+    window.addEventListener("mouseup", finishWindowDrag, true);
 
     unlisteners.push(
       await appWindow.listen("tauri://focus", async () => {
@@ -114,11 +141,15 @@
   onDestroy(() => {
     if (moveTimer !== undefined) window.clearTimeout(moveTimer);
     window.removeEventListener("keydown", createNoteWithControlN, true);
+    window.removeEventListener("mouseup", finishWindowDrag, true);
     unlisteners.forEach((unlisten) => unlisten());
   });
 </script>
 
-<div class="titlebar" class:hover={titlebarHovered} class:collapsed>
+{#if shortcutsWindow}
+  <ShortcutsHelp />
+{:else}
+  <div class="titlebar" class:hover={titlebarHovered} class:collapsed>
   <div
     class="drag-surface"
     onmousedown={(event) => {
@@ -161,6 +192,18 @@
     </button>
     <button
       class="titlebar-button"
+      disabled={stackBusy}
+      onclick={(event) => {
+        event.stopPropagation();
+        void resetVerticalStack();
+      }}
+      aria-label="stack all notes by vertical position"
+      title="Stack all notes by vertical position"
+    >
+      <Icon path={mdiLinkVariant} size={11} />
+    </button>
+    <button
+      class="titlebar-button"
       onclick={(event) => {
         event.stopPropagation();
         toggleColorMenu();
@@ -183,11 +226,12 @@
       {/each}
     {/if}
   </div>
-</div>
+  </div>
 
-<main class:collapsed>
-  <Editor bind:this={editor} onTitleChange={(title) => (noteTitle = title)} />
-</main>
+  <main class:collapsed>
+    <Editor bind:this={editor} onTitleChange={(title) => (noteTitle = title)} />
+  </main>
+{/if}
 
 <style>
   .titlebar {
@@ -217,7 +261,7 @@
     overflow: hidden;
     pointer-events: none;
     position: absolute;
-    right: 68px;
+    right: 88px;
     text-align: left;
     text-overflow: ellipsis;
     top: 0;

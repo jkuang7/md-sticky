@@ -4,6 +4,7 @@ node_modules
 /.svelte-kit
 !.svelte-kit/tsconfig.json
 /package
+/dist
 .env
 .env.*
 !.env.example

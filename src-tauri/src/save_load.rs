@@ -17,7 +17,10 @@ use tauri_plugin_log::log;
 use tauri_plugin_store::StoreExt;
 use uuid::Uuid;
 
-use crate::{settings::MenuSettings, windows::open_sticky};
+use crate::{
+    settings::MenuSettings,
+    windows::{open_sticky, reflow_linked_stack},
+};
 
 const BACKUP_FOLDER: &str = "backups";
 const NOTES_DATA: &str = "notes.json";
@@ -92,6 +95,8 @@ impl StoredNote {
 struct NoteStore {
     version: u32,
     notes: BTreeMap<String, StoredNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linked_stack: Option<Vec<String>>,
 }
 
 impl NoteStore {
@@ -99,6 +104,7 @@ impl NoteStore {
         Self {
             version: STORAGE_VERSION,
             notes: BTreeMap::new(),
+            linked_stack: None,
         }
     }
 
@@ -111,7 +117,20 @@ impl NoteStore {
 
     fn add_recovery_notice(&mut self, restored_previous: bool) {
         let note = StoredNote::recovery_notice(restored_previous);
+        if let Some(order) = &mut self.linked_stack {
+            order.push(note.id.clone());
+        }
         self.notes.insert(note.id.clone(), note);
+    }
+
+    fn ordered_notes(&self) -> Vec<StoredNote> {
+        let Some(order) = &self.linked_stack else {
+            return self.notes.values().cloned().collect();
+        };
+        order
+            .iter()
+            .filter_map(|id| self.notes.get(id).cloned())
+            .collect()
     }
 }
 
@@ -171,7 +190,7 @@ impl NoteRepository {
             .notes
             .lock()
             .map_err(|_| anyhow::anyhow!("Note storage lock poisoned"))?;
-        Ok(notes.notes.values().cloned().collect())
+        Ok(notes.ordered_notes())
     }
 
     pub fn active(&self) -> anyhow::Result<Vec<StoredNote>> {
@@ -204,6 +223,9 @@ impl NoteRepository {
         note.y = y;
         let result = note.clone();
         self.mutate(|store| {
+            if let Some(order) = &mut store.linked_stack {
+                order.push(note.id.clone());
+            }
             store.notes.insert(note.id.clone(), note);
             Ok(())
         })?;
@@ -230,6 +252,24 @@ impl NoteRepository {
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         self.mutate(|store| {
             store.notes.remove(id);
+            if let Some(order) = &mut store.linked_stack {
+                order.retain(|note_id| note_id != id);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn linked_stack(&self) -> anyhow::Result<Option<Vec<String>>> {
+        let notes = self
+            .notes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Note storage lock poisoned"))?;
+        Ok(notes.linked_stack.clone())
+    }
+
+    pub fn set_linked_stack(&self, order: Option<Vec<String>>) -> anyhow::Result<()> {
+        self.mutate(|store| {
+            store.linked_stack = order;
             Ok(())
         })
     }
@@ -302,6 +342,16 @@ fn validate_store(store: &NoteStore) -> anyhow::Result<()> {
         }
         if note.document.get("type").and_then(Value::as_str) != Some("doc") {
             bail!("Note {} did not contain a Tiptap document", note.id);
+        }
+    }
+    if let Some(order) = &store.linked_stack {
+        let unique: std::collections::BTreeSet<_> = order.iter().collect();
+        if unique.len() != order.len() {
+            bail!("Linked note stack contained duplicate note ids");
+        }
+        if order.len() != store.notes.len() || order.iter().any(|id| !store.notes.contains_key(id))
+        {
+            bail!("Linked note stack did not contain every stored note exactly once");
         }
     }
     Ok(())
@@ -464,9 +514,16 @@ pub fn note_id_from_label(label: &str) -> anyhow::Result<&str> {
 
 pub fn load_stickies(app: &AppHandle) -> anyhow::Result<()> {
     let repository = app.state::<NoteRepository>();
-    for note in repository.active()? {
+    let active = repository.active()?;
+    for note in &active {
         if let Err(error) = open_sticky(app, &note) {
             log::error!("Could not open note {}: {error:#}", note.id);
+        }
+    }
+    reflow_linked_stack(app)?;
+    if let Some(note) = active.iter().find(|note| !note.collapsed) {
+        if let Some(window) = app.get_webview_window(&format!("sticky_{}", note.id)) {
+            window.set_focus()?;
         }
     }
     Ok(())
@@ -607,6 +664,55 @@ mod tests {
         assert!(restored.closed_at.is_none());
         assert!(repository.get(&first.id).unwrap().closed_at.is_some());
         assert_eq!(repository.active().unwrap(), vec![restored]);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn linked_order_survives_close_restore_and_appends_new_notes() {
+        let dir = temp_dir("linked-order-lifecycle");
+        let repository = NoteRepository::load_from_dir(&dir).unwrap();
+        let first = repository.all().unwrap()[0].clone();
+        let second = repository.create().unwrap();
+        let third = repository.create().unwrap();
+        repository
+            .set_linked_stack(Some(vec![
+                third.id.clone(),
+                first.id.clone(),
+                second.id.clone(),
+            ]))
+            .unwrap();
+
+        repository.close(&first.id).unwrap();
+        assert_eq!(
+            repository
+                .active()
+                .unwrap()
+                .into_iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            vec![third.id.clone(), second.id.clone()]
+        );
+        repository.restore_last_closed().unwrap();
+        assert_eq!(
+            repository
+                .active()
+                .unwrap()
+                .into_iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            vec![third.id.clone(), first.id.clone(), second.id.clone()]
+        );
+
+        let fourth = repository.create().unwrap();
+        assert_eq!(
+            repository.linked_stack().unwrap().unwrap(),
+            vec![third.id, first.id, second.id, fourth.id]
+        );
+        let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
+        assert_eq!(
+            reloaded.linked_stack().unwrap(),
+            repository.linked_stack().unwrap()
+        );
         cleanup(dir);
     }
 

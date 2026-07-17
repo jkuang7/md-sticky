@@ -1,8 +1,38 @@
 import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Placeholder } from "@tiptap/extension-placeholder";
-import { Extension } from "@tiptap/core";
+import { Extension, type JSONContent } from "@tiptap/core";
 import { Selection, TextSelection } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
+
+function removeCheckedTasks(nodes: JSONContent[]): {
+  nodes: JSONContent[];
+  removed: boolean;
+} {
+  let removed = false;
+  const remaining = nodes.flatMap((node) => {
+    const children = removeCheckedTasks(node.content ?? []);
+    removed ||= children.removed;
+
+    if (node.type === "taskItem" && node.attrs?.checked === true) {
+      removed = true;
+      // Keep unfinished subtasks by promoting them into the containing list.
+      return children.nodes
+        .filter((child) => child.type === "taskList")
+        .flatMap((list) => list.content ?? []);
+    }
+
+    if (node.type === "taskList" && children.nodes.length === 0) {
+      removed = true;
+      return [];
+    }
+
+    return [
+      node.content === undefined ? node : { ...node, content: children.nodes },
+    ];
+  });
+
+  return { nodes: remaining, removed };
+}
 
 const StickyShortcuts = Extension.create({
   name: "stickyShortcuts",
@@ -83,6 +113,18 @@ const StickyShortcuts = Extension.create({
         return true;
       },
       "Mod-Shift-0": () => this.editor.commands.toggleBulletList(),
+      "Mod-Shift-x": () => {
+        const result = removeCheckedTasks(this.editor.getJSON().content ?? []);
+        if (!result.removed) return true;
+
+        return this.editor.commands.setContent({
+          type: "doc",
+          content:
+            result.nodes.length > 0
+              ? result.nodes
+              : [{ type: "paragraph" }],
+        });
+      },
       "Mod-Shift-c": () => {
         if (!this.editor.isActive("taskItem")) return false;
         const checked = Boolean(

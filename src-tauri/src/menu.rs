@@ -9,8 +9,9 @@ use tauri_plugin_log::log;
 use crate::save_load::save_settings;
 use crate::settings::MenuSettings;
 use crate::windows::{
-    create_sticky, cycle_focus, fit_text, request_close_sticky, reset_note_positions,
-    restore_last_closed, set_color, snap_window, Direction,
+    arrange_and_link_all_notes, create_sticky, cycle_focus, request_close_sticky,
+    reset_note_positions, restore_last_closed, set_color, snap_window, toggle_note_visibility,
+    toggle_shortcuts_window, unlink_notes, Direction,
 };
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
@@ -19,7 +20,9 @@ pub enum MenuCommand {
     CloseNote,
     ReopenClosedNote,
     ResetPositions,
-    FitText,
+    ArrangeAndLinkAllNotes,
+    UnlinkNotes,
+    ToggleNoteVisibility,
     NextNote,
     PrevNote,
     Color(u8),
@@ -27,6 +30,7 @@ pub enum MenuCommand {
     PartialSnap(Direction),
     BringToFront,
     AutoStart,
+    ToggleShortcuts,
 }
 
 impl From<MenuCommand> for MenuId {
@@ -68,8 +72,29 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
             &MenuItem::with_id(app, MenuCommand::NewNote, "New Note", true, Some("Cmd+N"))?,
             &MenuItem::with_id(
                 app,
+                MenuCommand::ToggleNoteVisibility,
+                "Hide/Show All Notes",
+                true,
+                Some("Cmd+Shift+H"),
+            )?,
+            &MenuItem::with_id(
+                app,
                 MenuCommand::ResetPositions,
                 "Reset Note Positions",
+                true,
+                None::<&str>,
+            )?,
+            &MenuItem::with_id(
+                app,
+                MenuCommand::ArrangeAndLinkAllNotes,
+                "Arrange & Link All Notes",
+                true,
+                None::<&str>,
+            )?,
+            &MenuItem::with_id(
+                app,
+                MenuCommand::UnlinkNotes,
+                "Unlink Notes",
                 true,
                 None::<&str>,
             )?,
@@ -184,14 +209,6 @@ fn create_edit_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error> {
             &PredefinedMenuItem::copy(app, None)?,
             &PredefinedMenuItem::paste(app, None)?,
         ])
-        .separator()
-        .item(&MenuItem::with_id(
-            app,
-            MenuCommand::FitText,
-            "Resize Note to Text",
-            true,
-            Some("Cmd+F"),
-        )?)
         .build()?;
 
     Ok(menu)
@@ -213,6 +230,19 @@ fn create_color_menu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error> {
     Ok(menu)
 }
 
+fn create_help_menu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error> {
+    SubmenuBuilder::new(app, "Help")
+        .item(&MenuItem::with_id(
+            app,
+            MenuCommand::ToggleShortcuts,
+            "Keyboard Shortcuts…",
+            true,
+            Some("F1"),
+        )?)
+        .build()
+        .map_err(Into::into)
+}
+
 pub fn create_menu(app: &AppHandle) -> Result<Menu<Wry>, anyhow::Error> {
     let menu = MenuBuilder::new(app)
         .items(&[
@@ -221,6 +251,7 @@ pub fn create_menu(app: &AppHandle) -> Result<Menu<Wry>, anyhow::Error> {
             &create_snap_submenu(app)?,
             &create_partial_snap_submenu(app)?,
             &create_color_menu(app)?,
+            &create_help_menu(app)?,
         ])
         .build()?;
 
@@ -233,16 +264,19 @@ pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
             if let Err(e) = match command {
                 MenuCommand::NewNote => create_sticky(app).map(|_| ()),
                 MenuCommand::ResetPositions => reset_note_positions(app),
+                MenuCommand::ArrangeAndLinkAllNotes => arrange_and_link_all_notes(app),
+                MenuCommand::UnlinkNotes => unlink_notes(app),
                 MenuCommand::Snap(direction) => snap_window(app, direction, false),
                 MenuCommand::PartialSnap(direction) => snap_window(app, direction, true),
                 MenuCommand::CloseNote => request_close_sticky(app),
                 MenuCommand::ReopenClosedNote => restore_last_closed(app),
+                MenuCommand::ToggleNoteVisibility => toggle_note_visibility(app),
                 MenuCommand::NextNote => cycle_focus(app, false),
                 MenuCommand::PrevNote => cycle_focus(app, true),
-                MenuCommand::FitText => fit_text(app),
                 MenuCommand::Color(index) => set_color(app, index),
                 MenuCommand::BringToFront => save_settings(app),
                 MenuCommand::AutoStart => apply_autostart_preference(app),
+                MenuCommand::ToggleShortcuts => toggle_shortcuts_window(app),
                 // _ => Err(anyhow::anyhow!("unimplemented command: {:?}", command)),
             } {
                 log::error!("Error executing command: {:?} : {:#}", command, e);

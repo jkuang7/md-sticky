@@ -1,13 +1,20 @@
 use std::{collections::HashSet, iter::once, sync::Mutex};
 
 use anyhow::Context;
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSWindow, NSWindowOrderingMode};
 use serde_json::Value;
 use tauri::Manager;
 
 use crate::{
     save_load::{note_id_from_label, NoteRepository},
     settings::MenuSettings,
-    windows::{close_window_and_archive, create_sticky, set_window_collapsed, sorted_windows},
+    windows::{
+        arrange_and_link_all_notes, close_window_and_archive, create_sticky, set_window_collapsed,
+        sorted_windows, DragCoordinator,
+    },
 };
 
 #[derive(Default)]
@@ -20,6 +27,55 @@ enum QuitState {
 
 #[derive(Default)]
 pub struct QuitCoordinator(Mutex<QuitState>);
+
+#[cfg(target_os = "macos")]
+struct AttachedChildWindows {
+    parent: Retained<NSWindow>,
+    children: Vec<Retained<NSWindow>>,
+}
+
+#[cfg(target_os = "macos")]
+impl AttachedChildWindows {
+    fn new(
+        parent: &tauri::WebviewWindow,
+        children: Vec<tauri::WebviewWindow>,
+    ) -> Result<Self, String> {
+        fn retain_native_window(
+            window: &tauri::WebviewWindow,
+        ) -> Result<Retained<NSWindow>, String> {
+            let pointer = window.ns_window().map_err(|error| error.to_string())?;
+            unsafe { Retained::retain(pointer.cast::<NSWindow>()) }
+                .ok_or_else(|| format!("Could not retain native window {}", window.label()))
+        }
+
+        let parent = retain_native_window(parent)?;
+        let children = children
+            .iter()
+            .map(retain_native_window)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for child in &children {
+            unsafe {
+                parent.addChildWindow_ordered(child, NSWindowOrderingMode::Below);
+            }
+        }
+
+        Ok(Self { parent, children })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for AttachedChildWindows {
+    fn drop(&mut self) {
+        for child in self.children.iter().rev() {
+            // This call was unsafe in objc2-app-kit 0.3.1 and is safe in 0.3.2.
+            #[allow(unused_unsafe)]
+            unsafe {
+                self.parent.removeChildWindow(child);
+            }
+        }
+    }
+}
 
 impl QuitCoordinator {
     pub fn begin(&self, labels: HashSet<String>) -> anyhow::Result<bool> {
@@ -96,56 +152,81 @@ pub fn bring_all_to_front(
 }
 
 #[tauri::command]
-pub fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+pub fn start_window_drag(
+    window: tauri::WebviewWindow,
+    coordinator: tauri::State<DragCoordinator>,
+) -> Result<(), String> {
+    let linked_windows = coordinator
+        .begin(window.app_handle(), &window)
+        .map_err(|error| error.to_string())?;
+
     #[cfg(target_os = "macos")]
     {
         use objc2::MainThreadMarker;
-        use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType, NSWindow};
+        use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType};
 
-        let Some(main_thread) = MainThreadMarker::new() else {
-            tauri_plugin_log::log::error!(
-                "Window drag command did not run on the macOS main thread"
-            );
-            return Err("Window drag must start on the macOS main thread".to_string());
-        };
-        let ns_window_ptr = window.ns_window().map_err(|error| error.to_string())?;
-        let ns_window = unsafe { &*(ns_window_ptr as *const NSWindow) };
-        let current_event = NSApplication::sharedApplication(main_thread).currentEvent();
-        if current_event.is_none() {
-            tauri_plugin_log::log::error!("Window drag command had no current AppKit event");
-        }
-        let (modifier_flags, timestamp, event_number, click_count, pressure) = current_event
-            .as_deref()
-            .map(|event| {
-                (
-                    event.modifierFlags(),
-                    event.timestamp(),
-                    event.eventNumber(),
-                    event.clickCount(),
-                    event.pressure(),
+        let result = (|| -> Result<(), String> {
+            let Some(main_thread) = MainThreadMarker::new() else {
+                tauri_plugin_log::log::error!(
+                    "Window drag command did not run on the macOS main thread"
+                );
+                return Err("Window drag must start on the macOS main thread".to_string());
+            };
+            let ns_window_ptr = window.ns_window().map_err(|error| error.to_string())?;
+            let ns_window = unsafe { &*(ns_window_ptr as *const NSWindow) };
+            let _attached_children = AttachedChildWindows::new(&window, linked_windows)?;
+            let current_event = NSApplication::sharedApplication(main_thread)
+                .currentEvent()
+                .filter(|event| {
+                    event.r#type() == NSEventType::LeftMouseDown
+                        && event.windowNumber() == ns_window.windowNumber()
+                });
+            let event = if let Some(event) = current_event {
+                event
+            } else {
+                let location = ns_window.convertPointFromScreen(NSEvent::mouseLocation());
+                NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                    NSEventType::LeftMouseDown,
+                    location,
+                    NSEventModifierFlags::empty(),
+                    0.0,
+                    ns_window.windowNumber(),
+                    None,
+                    0,
+                    1,
+                    1.0,
                 )
-            })
-            .unwrap_or_else(|| (NSEventModifierFlags::empty(), 0.0, 0, 1, 1.0));
-        let location = ns_window.convertPointFromScreen(NSEvent::mouseLocation());
-        let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-            NSEventType::LeftMouseDown,
-            location,
-            modifier_flags,
-            timestamp,
-            ns_window.windowNumber(),
-            None,
-            event_number,
-            click_count.max(1),
-            pressure.max(1.0),
-        )
-        .ok_or_else(|| "Could not construct the macOS window drag event".to_string())?;
+                .ok_or_else(|| "Could not construct the macOS window drag event".to_string())?
+            };
 
-        ns_window.performWindowDragWithEvent(&event);
-        Ok(())
+            ns_window.performWindowDragWithEvent(&event);
+            Ok(())
+        })();
+        let finish_result = coordinator.finish().map_err(|error| error.to_string());
+        let focus_result = window.set_focus().map_err(|error| error.to_string());
+        result.and(finish_result).and(focus_result)
     }
 
     #[cfg(not(target_os = "macos"))]
-    window.start_dragging().map_err(|error| error.to_string())
+    {
+        let _ = linked_windows;
+        if let Err(error) = window.start_dragging() {
+            let _ = coordinator.finish();
+            return Err(error.to_string());
+        }
+        coordinator.finish().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())
+    }
+}
+
+#[tauri::command]
+pub fn finish_window_drag(coordinator: tauri::State<DragCoordinator>) -> Result<(), String> {
+    coordinator.finish().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn reset_vertical_stack(app: tauri::AppHandle) -> Result<(), String> {
+    arrange_and_link_all_notes(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -221,7 +302,7 @@ pub fn set_note_always_on_top(
             Ok(())
         })
         .map_err(|error| error.to_string())?;
-    Ok(())
+    window.set_focus().map_err(|error| error.to_string())
 }
 
 #[tauri::command]

@@ -122,15 +122,6 @@
     requestAnimationFrame(() => editor?.commands.focus());
 
     unlisteners.push(
-      await appWindow.listen("fit_text", async () => {
-        const editable = element.querySelector<HTMLElement>(".tiptap");
-        if (!editable) return;
-        const factor = await appWindow.scaleFactor();
-        const windowSize = (await appWindow.outerSize()).toLogical(factor);
-        await appWindow.setSize(
-          new LogicalSize(windowSize.width, editable.scrollHeight + 24),
-        );
-      }),
       await listen("save_request", () => flushSave()),
       await listen("flush_before_quit", async () => {
         try {

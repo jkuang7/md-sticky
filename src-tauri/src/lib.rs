@@ -8,7 +8,7 @@ use crate::commands::*;
 use crate::menu::{create_menu, handle_menu_event};
 use crate::save_load::{load_settings, load_stickies, NoteRepository};
 use crate::settings::MenuSettings;
-use crate::windows::focus_existing_or_create;
+use crate::windows::{focus_existing_or_create, DragCoordinator, NoteVisibility};
 
 mod commands;
 mod menu;
@@ -99,6 +99,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bring_all_to_front,
             start_window_drag,
+            finish_window_drag,
+            reset_vertical_stack,
             create_note,
             save_note,
             close_window,
@@ -107,6 +109,8 @@ pub fn run() {
             acknowledge_quit,
         ])
         .manage(QuitCoordinator::default())
+        .manage(DragCoordinator::default())
+        .manage(NoteVisibility::default())
         .setup(setup)
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -117,7 +121,11 @@ pub fn run() {
                     Ok(true) => log::info!("exit code: {:?}", code),
                     Ok(false) => {
                         api.prevent_exit();
-                        let labels: HashSet<_> = app.webview_windows().into_keys().collect();
+                        let labels: HashSet<_> = app
+                            .webview_windows()
+                            .into_keys()
+                            .filter(|label| label.starts_with("sticky_"))
+                            .collect();
                         let has_windows = !labels.is_empty();
                         match coordinator.begin(labels) {
                             Ok(true) if has_windows => {
