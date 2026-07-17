@@ -1,6 +1,6 @@
-# Sticky
+# StickyMD
 
-A minimal, local-first Markdown sticky-note app for Apple Silicon Macs.
+A minimal, local-first Markdown sticky-note app for Apple Silicon Macs. The installed macOS app is named **Sticky**.
 
 https://github.com/user-attachments/assets/7b61d4fa-8e2a-4b80-af09-37120dd7e8cb
 
@@ -21,8 +21,8 @@ Sticky is a personal fork of the original macOS Stickies-inspired project. This 
 Sticky supports Apple Silicon Macs (M1 or newer) and requires Git. Open **Terminal** and run:
 
 ```sh
-git clone https://github.com/jkuang7/md-sticky.git
-cd md-sticky
+git clone https://github.com/jkuang7/StickyMD.git
+cd StickyMD
 ./install.sh
 ```
 
@@ -44,7 +44,7 @@ See Apple's [Open apps safely on your Mac](https://support.apple.com/102445) gui
 If you used the installation commands above, the repository is in your home folder. Open Terminal and run:
 
 ```sh
-cd ~/md-sticky
+cd ~/StickyMD
 git pull --ff-only
 ./install.sh
 ```
@@ -67,7 +67,7 @@ Closing a note with `Command + W` archives it instead of immediately deleting it
 
 1. Quit Sticky with `Command + Q`.
 2. Move `/Applications/Sticky.app` to the Trash.
-3. Delete the `md-sticky` repository folder if you no longer need it for updates.
+3. Delete the `StickyMD` repository folder if you no longer need it for updates.
 
 Your notes remain in the Application Support folder shown above unless you delete that folder separately.
 
@@ -101,7 +101,7 @@ Standard editing shortcuts such as copy, cut, paste, undo, and redo also work.
 Run `./install.sh` once to create the project-local Node.js and Rust toolchains. In each new Terminal session, enter the repository and expose those tools for development:
 
 ```sh
-cd ~/md-sticky
+cd ~/StickyMD
 export CARGO_HOME="$PWD/.tools/cargo"
 export RUSTUP_HOME="$PWD/.tools/rustup"
 export PATH="$PWD/.tools/node/bin:$CARGO_HOME/bin:$PATH"
