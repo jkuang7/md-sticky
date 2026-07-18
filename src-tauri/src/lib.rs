@@ -100,7 +100,7 @@ pub fn run() {
             bring_all_to_front,
             start_window_drag,
             finish_window_drag,
-            reset_vertical_stack,
+            link_all_notes_to_current_note,
             create_note,
             save_note,
             close_window,

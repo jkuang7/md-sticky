@@ -12,7 +12,7 @@ use crate::{
     save_load::{note_id_from_label, NoteRepository},
     settings::MenuSettings,
     windows::{
-        arrange_and_link_all_notes, close_window_and_archive, create_sticky, set_window_collapsed,
+        close_window_and_archive, create_sticky, link_all_notes_to, set_window_collapsed,
         sorted_windows, DragCoordinator,
     },
 };
@@ -225,8 +225,11 @@ pub fn finish_window_drag(coordinator: tauri::State<DragCoordinator>) -> Result<
 }
 
 #[tauri::command]
-pub fn reset_vertical_stack(app: tauri::AppHandle) -> Result<(), String> {
-    arrange_and_link_all_notes(&app).map_err(|error| error.to_string())
+pub fn link_all_notes_to_current_note(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    link_all_notes_to(&app, &window).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

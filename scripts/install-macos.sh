@@ -10,6 +10,10 @@ STAGING_APP="$APPLICATIONS_DIR/.Sticky.install.$$"
 BACKUP_APP="$APPLICATIONS_DIR/.Sticky.backup.$$"
 APP_BUNDLE_ID="local.jian.mdsticky"
 APP_PROCESS="md-sticky-local"
+APP_DATA_DIR="$HOME/Library/Application Support/$APP_BUNDLE_ID"
+NOTES_FILE="$APP_DATA_DIR/notes.json"
+PREINSTALL_NOTES="$APP_DATA_DIR/notes.preinstall.json"
+PREINSTALL_STAGING="$APP_DATA_DIR/.notes.preinstall.$$"
 
 cd "$ROOT_DIR"
 
@@ -33,6 +37,7 @@ fi
 
 rollback() {
   rm -rf "$STAGING_APP"
+  rm -f "$PREINSTALL_STAGING"
   if [[ ! -e "$TARGET_APP" && -e "$BACKUP_APP" ]]; then
     mv "$BACKUP_APP" "$TARGET_APP"
   fi
@@ -51,6 +56,13 @@ echo "Preparing the new app..."
 rm -rf "$STAGING_APP" "$BACKUP_APP"
 ditto "$SOURCE_APP" "$STAGING_APP"
 codesign --verify --deep --strict "$STAGING_APP"
+
+if [[ -f "$NOTES_FILE" ]]; then
+  echo "Preserving a pre-install note snapshot..."
+  mkdir -p "$APP_DATA_DIR"
+  ditto "$NOTES_FILE" "$PREINSTALL_STAGING"
+  mv -f "$PREINSTALL_STAGING" "$PREINSTALL_NOTES"
+fi
 
 echo "Saving notes and quitting the running app..."
 if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then

@@ -27,6 +27,7 @@ const NOTES_DATA: &str = "notes.json";
 const PREVIOUS_NOTES_DATA: &str = "notes.previous.json";
 const SETTINGS: &str = "settings";
 const STORAGE_VERSION: u32 = 1;
+const ARCHIVE_RETENTION_MILLIS: u64 = 30 * 24 * 60 * 60 * 1_000;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq)]
@@ -132,6 +133,16 @@ impl NoteStore {
             .filter_map(|id| self.notes.get(id).cloned())
             .collect()
     }
+
+    fn purge_archived_before(&mut self, cutoff: u64) -> usize {
+        let previous_count = self.notes.len();
+        self.notes
+            .retain(|_, note| note.closed_at.is_none_or(|closed_at| closed_at >= cutoff));
+        if let Some(order) = &mut self.linked_stack {
+            order.retain(|id| self.notes.contains_key(id));
+        }
+        previous_count - self.notes.len()
+    }
 }
 
 fn empty_document() -> Value {
@@ -158,7 +169,7 @@ impl NoteRepository {
         let path = app_data_dir.join(NOTES_DATA);
         let previous_path = app_data_dir.join(PREVIOUS_NOTES_DATA);
 
-        let store = if path.exists() {
+        let mut store = if path.exists() {
             let current_bytes = fs::read(&path).context("Failed to read note storage")?;
             match parse_store(&current_bytes) {
                 Ok(store) => store,
@@ -177,6 +188,13 @@ impl NoteRepository {
             persist_store(&path, &previous_path, &store, false)?;
             store
         };
+
+        let cutoff = current_time_millis()?.saturating_sub(ARCHIVE_RETENTION_MILLIS);
+        let purged_count = store.purge_archived_before(cutoff);
+        if purged_count > 0 {
+            persist_store(&path, &previous_path, &store, true)?;
+            log::info!("Purged {purged_count} archived note(s) older than 30 days");
+        }
 
         Ok(Self {
             path,
@@ -274,32 +292,47 @@ impl NoteRepository {
         })
     }
 
-    pub fn set_linked_stack_and_widths(
+    pub fn set_linked_arrangement(
         &self,
         order: Vec<String>,
-        note_ids: &[String],
+        positions: &[(String, i32, i32)],
         expanded_width: u32,
     ) -> anyhow::Result<()> {
         self.mutate(|store| {
-            for id in note_ids {
-                store
+            for (id, x, y) in positions {
+                let note = store
                     .notes
                     .get_mut(id)
-                    .with_context(|| format!("Unknown note id {id}"))?
-                    .expanded_width = expanded_width;
+                    .with_context(|| format!("Unknown note id {id}"))?;
+                note.expanded_width = expanded_width;
+                note.x = *x;
+                note.y = *y;
             }
             store.linked_stack = Some(order);
             Ok(())
         })
     }
 
+    pub fn clear_linked_stack_and_set_positions(
+        &self,
+        positions: &[(String, i32, i32)],
+    ) -> anyhow::Result<()> {
+        self.mutate(|store| {
+            for (id, x, y) in positions {
+                let note = store
+                    .notes
+                    .get_mut(id)
+                    .with_context(|| format!("Cannot position missing note {id}"))?;
+                note.x = *x;
+                note.y = *y;
+            }
+            store.linked_stack = None;
+            Ok(())
+        })
+    }
+
     pub fn close(&self, id: &str) -> anyhow::Result<StoredNote> {
-        let closed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("System time is before UNIX epoch")?
-            .as_millis()
-            .try_into()
-            .context("System timestamp did not fit in note storage")?;
+        let closed_at = current_time_millis()?;
         self.update(id, |note| {
             note.closed_at = Some(closed_at);
             Ok(())
@@ -323,6 +356,19 @@ impl NoteRepository {
         .map(Some)
     }
 
+    pub fn restore_all_closed(&self) -> anyhow::Result<usize> {
+        let mut restored_count = 0;
+        self.mutate(|store| {
+            for note in store.notes.values_mut() {
+                if note.closed_at.take().is_some() {
+                    restored_count += 1;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(restored_count)
+    }
+
     fn mutate<F>(&self, update: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut NoteStore) -> anyhow::Result<()>,
@@ -338,6 +384,15 @@ impl NoteRepository {
         *guard = candidate;
         Ok(())
     }
+}
+
+fn current_time_millis() -> anyhow::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System time is before UNIX epoch")?
+        .as_millis()
+        .try_into()
+        .context("System timestamp did not fit in note storage")
 }
 
 fn parse_store(bytes: &[u8]) -> anyhow::Result<NoteStore> {
@@ -687,6 +742,54 @@ mod tests {
     }
 
     #[test]
+    fn expired_archives_are_purged_and_restore_all_recovers_the_rest() {
+        let dir = temp_dir("archive-retention-and-restore-all");
+        let repository = NoteRepository::load_from_dir(&dir).unwrap();
+        let active = repository.all().unwrap()[0].clone();
+        let recent = repository.create().unwrap();
+        let expired = repository.create().unwrap();
+        repository
+            .set_linked_stack(Some(vec![
+                active.id.clone(),
+                recent.id.clone(),
+                expired.id.clone(),
+            ]))
+            .unwrap();
+        let now = current_time_millis().unwrap();
+        repository
+            .update(&recent.id, |note| {
+                note.closed_at = Some(now);
+                Ok(())
+            })
+            .unwrap();
+        repository
+            .update(&expired.id, |note| {
+                note.closed_at = Some(now - ARCHIVE_RETENTION_MILLIS - 1);
+                Ok(())
+            })
+            .unwrap();
+        drop(repository);
+
+        let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
+        assert!(reloaded.get(&expired.id).is_err());
+        assert_eq!(
+            reloaded.linked_stack().unwrap().unwrap(),
+            vec![active.id.clone(), recent.id.clone()]
+        );
+        assert_eq!(reloaded.restore_all_closed().unwrap(), 1);
+        assert_eq!(
+            reloaded
+                .active()
+                .unwrap()
+                .into_iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            vec![active.id, recent.id]
+        );
+        cleanup(dir);
+    }
+
+    #[test]
     fn linked_order_survives_close_restore_and_appends_new_notes() {
         let dir = temp_dir("linked-order-lifecycle");
         let repository = NoteRepository::load_from_dir(&dir).unwrap();
@@ -736,33 +839,94 @@ mod tests {
     }
 
     #[test]
-    fn linked_arrangement_persists_widths_and_rolls_back_invalid_updates() {
-        let dir = temp_dir("linked-arrangement-widths");
+    fn reset_positions_clears_link_without_restoring_archived_notes() {
+        let dir = temp_dir("reset-unlinks");
+        let repository = NoteRepository::load_from_dir(&dir).unwrap();
+        let active = repository.all().unwrap()[0].clone();
+        let archived = repository.create().unwrap();
+        repository
+            .set_linked_stack(Some(vec![active.id.clone(), archived.id.clone()]))
+            .unwrap();
+        repository.close(&archived.id).unwrap();
+
+        repository
+            .clear_linked_stack_and_set_positions(&[(active.id.clone(), 20, 40)])
+            .unwrap();
+
+        assert_eq!(repository.linked_stack().unwrap(), None);
+        assert_eq!(
+            (
+                repository.get(&active.id).unwrap().x,
+                repository.get(&active.id).unwrap().y
+            ),
+            (20, 40)
+        );
+        assert!(repository.get(&archived.id).unwrap().closed_at.is_some());
+        cleanup(dir);
+    }
+
+    #[test]
+    fn linked_arrangement_persists_order_widths_and_positions_atomically() {
+        let dir = temp_dir("linked-arrangement");
         let repository = NoteRepository::load_from_dir(&dir).unwrap();
         let first = repository.all().unwrap()[0].clone();
         let second = repository.create().unwrap();
         let order = vec![second.id.clone(), first.id.clone()];
 
         repository
-            .set_linked_stack_and_widths(order.clone(), &[first.id.clone()], 420)
+            .set_linked_arrangement(
+                order.clone(),
+                &[(first.id.clone(), 40, 50), (second.id.clone(), 40, 312)],
+                300,
+            )
             .unwrap();
-        assert_eq!(repository.get(&first.id).unwrap().expanded_width, 420);
+        assert_eq!(repository.get(&first.id).unwrap().expanded_width, 300);
+        assert_eq!(
+            (
+                repository.get(&first.id).unwrap().x,
+                repository.get(&first.id).unwrap().y
+            ),
+            (40, 50)
+        );
         assert_eq!(repository.get(&second.id).unwrap().expanded_width, 300);
+        assert_eq!(
+            (
+                repository.get(&second.id).unwrap().x,
+                repository.get(&second.id).unwrap().y
+            ),
+            (40, 312)
+        );
         assert_eq!(repository.linked_stack().unwrap(), Some(order.clone()));
 
-        let invalid_ids = vec![second.id.clone(), "missing-note".to_string()];
         assert!(repository
-            .set_linked_stack_and_widths(
+            .set_linked_arrangement(
                 vec![first.id.clone(), second.id.clone()],
-                &invalid_ids,
+                &[
+                    (second.id.clone(), 900, 901),
+                    ("missing-note".to_string(), 1, 2)
+                ],
                 777,
             )
             .is_err());
         assert_eq!(repository.get(&second.id).unwrap().expanded_width, 300);
+        assert_eq!(
+            (
+                repository.get(&second.id).unwrap().x,
+                repository.get(&second.id).unwrap().y
+            ),
+            (40, 312)
+        );
         assert_eq!(repository.linked_stack().unwrap(), Some(order.clone()));
 
         let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
-        assert_eq!(reloaded.get(&first.id).unwrap().expanded_width, 420);
+        assert_eq!(reloaded.get(&first.id).unwrap().expanded_width, 300);
+        assert_eq!(
+            (
+                reloaded.get(&first.id).unwrap().x,
+                reloaded.get(&first.id).unwrap().y
+            ),
+            (40, 50)
+        );
         assert_eq!(reloaded.linked_stack().unwrap(), Some(order));
         cleanup(dir);
     }

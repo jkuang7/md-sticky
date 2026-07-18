@@ -9,6 +9,8 @@
         ["New note", "⌘ N"],
         ["Close note", "⌘ W"],
         ["Reopen last closed note", "⇧ ⌘ T"],
+        ["Restore all notes", "⇧ ⌘ U"],
+        ["Reset positions and unlink notes", "⇧ ⌘ R"],
         ["Hide or show all notes", "⇧ ⌘ H"],
         ["Quit Sticky", "⌘ Q"],
       ],
@@ -30,6 +32,7 @@
       shortcuts: [
         ["Focus next note", "⌘ /"],
         ["Focus previous note", "⌥ ⌘ /"],
+        ["Link all notes to current note", "⇧ ⌘ L"],
         ["Align with next note or screen edge", "⌥ ⌘ + Arrow"],
         ["Align with any nearby edge", "⇧ ⌥ ⌘ + Arrow"],
         ["Set color 1–7", "⌘ 1–7"],

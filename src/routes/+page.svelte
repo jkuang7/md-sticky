@@ -49,11 +49,12 @@
     await invoke("set_note_always_on_top", { alwaysOnTop });
   }
 
-  async function resetVerticalStack() {
+  async function linkAllNotes() {
     if (stackBusy) return;
     stackBusy = true;
     try {
-      await invoke("reset_vertical_stack");
+      await editor?.flushSave();
+      await invoke("link_all_notes_to_current_note");
     } finally {
       stackBusy = false;
     }
@@ -195,10 +196,10 @@
       disabled={stackBusy}
       onclick={(event) => {
         event.stopPropagation();
-        void resetVerticalStack();
+        void linkAllNotes();
       }}
-      aria-label="stack all notes by vertical position"
-      title="Stack all notes by vertical position"
+      aria-label="Link all notes to this note."
+      title="Link all notes to this note."
     >
       <Icon path={mdiLinkVariant} size={11} />
     </button>

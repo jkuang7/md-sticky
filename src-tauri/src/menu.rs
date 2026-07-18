@@ -9,9 +9,9 @@ use tauri_plugin_log::log;
 use crate::save_load::save_settings;
 use crate::settings::MenuSettings;
 use crate::windows::{
-    arrange_and_link_all_notes, create_sticky, cycle_focus, request_close_sticky,
-    reset_note_positions, restore_last_closed, set_color, snap_window, toggle_note_visibility,
-    toggle_shortcuts_window, unlink_notes, Direction,
+    create_sticky, cycle_focus, link_all_notes_to_focused, request_close_sticky,
+    reset_note_positions, restore_all_notes, restore_last_closed, set_color, snap_window,
+    toggle_note_visibility, toggle_shortcuts_window, unlink_notes, Direction,
 };
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
@@ -19,6 +19,7 @@ pub enum MenuCommand {
     NewNote,
     CloseNote,
     ReopenClosedNote,
+    RestoreAllNotes,
     ResetPositions,
     ArrangeAndLinkAllNotes,
     UnlinkNotes,
@@ -69,6 +70,13 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
                 true,
                 Some("Cmd+Shift+T"),
             )?,
+            &MenuItem::with_id(
+                app,
+                MenuCommand::RestoreAllNotes,
+                "Restore All Notes",
+                true,
+                Some("Cmd+Shift+U"),
+            )?,
             &MenuItem::with_id(app, MenuCommand::NewNote, "New Note", true, Some("Cmd+N"))?,
             &MenuItem::with_id(
                 app,
@@ -82,14 +90,14 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
                 MenuCommand::ResetPositions,
                 "Reset Note Positions",
                 true,
-                None::<&str>,
+                Some("Cmd+Shift+R"),
             )?,
             &MenuItem::with_id(
                 app,
                 MenuCommand::ArrangeAndLinkAllNotes,
-                "Arrange & Link All Notes",
+                "Link All Notes to Current Note",
                 true,
-                None::<&str>,
+                Some("Cmd+Shift+L"),
             )?,
             &MenuItem::with_id(
                 app,
@@ -264,12 +272,13 @@ pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
             if let Err(e) = match command {
                 MenuCommand::NewNote => create_sticky(app).map(|_| ()),
                 MenuCommand::ResetPositions => reset_note_positions(app),
-                MenuCommand::ArrangeAndLinkAllNotes => arrange_and_link_all_notes(app),
+                MenuCommand::ArrangeAndLinkAllNotes => link_all_notes_to_focused(app),
                 MenuCommand::UnlinkNotes => unlink_notes(app),
                 MenuCommand::Snap(direction) => snap_window(app, direction, false),
                 MenuCommand::PartialSnap(direction) => snap_window(app, direction, true),
                 MenuCommand::CloseNote => request_close_sticky(app),
                 MenuCommand::ReopenClosedNote => restore_last_closed(app),
+                MenuCommand::RestoreAllNotes => restore_all_notes(app),
                 MenuCommand::ToggleNoteVisibility => toggle_note_visibility(app),
                 MenuCommand::NextNote => cycle_focus(app, false),
                 MenuCommand::PrevNote => cycle_focus(app, true),
