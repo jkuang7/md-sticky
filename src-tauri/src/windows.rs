@@ -171,6 +171,7 @@ fn translated_positions(
 struct WindowSnapshot {
     window: WebviewWindow,
     position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,9 +337,11 @@ fn linked_window_snapshots(app: &AppHandle) -> anyhow::Result<Option<Vec<WindowS
             continue;
         };
         let position = window.outer_position()?;
+        let size = window.outer_size()?;
         snapshots.push(WindowSnapshot {
             window: window.clone(),
             position,
+            size,
         });
     }
     Ok(Some(snapshots))
@@ -353,6 +356,48 @@ fn restore_positions(snapshots: &[WindowSnapshot]) {
             );
         }
     }
+}
+
+fn restore_geometry(snapshots: &[WindowSnapshot]) {
+    for snapshot in snapshots {
+        if let Err(error) = snapshot.window.set_size(snapshot.size) {
+            log::error!(
+                "Could not restore linked note {} size after arranging failure: {error}",
+                snapshot.window.label()
+            );
+        }
+        if let Err(error) = snapshot.window.set_position(snapshot.position) {
+            log::error!(
+                "Could not restore linked note {} position after arranging failure: {error}",
+                snapshot.window.label()
+            );
+        }
+    }
+}
+
+fn reset_snapshot_widths(snapshots: &[WindowSnapshot]) -> anyhow::Result<()> {
+    let heights = snapshots
+        .iter()
+        .map(|snapshot| {
+            let scale_factor = snapshot.window.scale_factor()?;
+            Ok(snapshot.size.to_logical::<u32>(scale_factor).height)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for (snapshot, height) in snapshots.iter().zip(heights) {
+        if let Err(error) = snapshot
+            .window
+            .set_size(LogicalSize::new(DEFAULT_NOTE_WIDTH, height))
+        {
+            restore_geometry(snapshots);
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not reset linked note {} width",
+                    snapshot.window.label()
+                )
+            });
+        }
+    }
+    Ok(())
 }
 
 fn move_snapshots(
@@ -373,19 +418,33 @@ fn move_snapshots(
     Ok(())
 }
 
-pub fn reflow_linked_stack(app: &AppHandle) -> anyhow::Result<()> {
+fn reflow_linked_stack_from_horizontal_anchor(
+    app: &AppHandle,
+    horizontal_anchor: Option<&str>,
+) -> anyhow::Result<()> {
     let Some(snapshots) = linked_window_snapshots(app)? else {
         return Ok(());
     };
     let Some(first) = snapshots.first() else {
         return Ok(());
     };
-    let targets = vertical_stack_positions(
-        first.position,
-        snapshots.len(),
-        physical_stack_step(&first.window)?,
-    )?;
+    let origin = PhysicalPosition::new(
+        horizontal_anchor
+            .and_then(|label| {
+                snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.window.label() == label)
+            })
+            .map_or(first.position.x, |snapshot| snapshot.position.x),
+        first.position.y,
+    );
+    let targets =
+        vertical_stack_positions(origin, snapshots.len(), physical_stack_step(&first.window)?)?;
     move_snapshots(&snapshots, &targets)
+}
+
+pub fn reflow_linked_stack(app: &AppHandle) -> anyhow::Result<()> {
+    reflow_linked_stack_from_horizontal_anchor(app, None)
 }
 
 pub fn arrange_and_link_all_notes(app: &AppHandle) -> anyhow::Result<()> {
@@ -416,20 +475,32 @@ pub fn arrange_and_link_all_notes(app: &AppHandle) -> anyhow::Result<()> {
     for id in &order {
         if let Some(window) = windows.get(&format!("sticky_{id}")) {
             let position = window.outer_position()?;
+            let size = window.outer_size()?;
             snapshots.push(WindowSnapshot {
                 window: window.clone(),
                 position,
+                size,
             });
         }
     }
+    let resized_ids = snapshots
+        .iter()
+        .map(|snapshot| note_id_from_label(snapshot.window.label()).map(str::to_owned))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     if let Some((origin, step)) = stack_origin {
         let targets = vertical_stack_positions(origin, snapshots.len(), step)?;
-        move_snapshots(&snapshots, &targets)?;
+        reset_snapshot_widths(&snapshots)?;
+        if let Err(error) = move_snapshots(&snapshots, &targets) {
+            restore_geometry(&snapshots);
+            return Err(error);
+        }
     }
 
-    if let Err(error) = repository.set_linked_stack(Some(order)) {
-        restore_positions(&snapshots);
-        return Err(error).context("Could not persist linked note order");
+    if let Err(error) =
+        repository.set_linked_stack_and_widths(order, &resized_ids, DEFAULT_NOTE_WIDTH)
+    {
+        restore_geometry(&snapshots);
+        return Err(error).context("Could not persist linked note arrangement");
     }
     Ok(())
 }
@@ -796,7 +867,6 @@ pub fn open_sticky(app: &AppHandle, note: &StoredNote) -> Result<WebviewWindow, 
 
     let window = builder.build().context("Could not create sticky window")?;
     let app_clone = app.clone();
-    #[cfg(not(target_os = "macos"))]
     let window_label = window.label().to_string();
     window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { .. } => {
@@ -809,7 +879,9 @@ pub fn open_sticky(app: &AppHandle, note: &StoredNote) -> Result<WebviewWindow, 
             }
         }
         WindowEvent::Resized(_) => {
-            if let Err(error) = reflow_linked_stack(&app_clone) {
+            if let Err(error) =
+                reflow_linked_stack_from_horizontal_anchor(&app_clone, Some(&window_label))
+            {
                 log::error!("Could not reflow resized linked note stack: {error:#}");
             }
         }

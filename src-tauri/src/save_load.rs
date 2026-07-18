@@ -274,6 +274,25 @@ impl NoteRepository {
         })
     }
 
+    pub fn set_linked_stack_and_widths(
+        &self,
+        order: Vec<String>,
+        note_ids: &[String],
+        expanded_width: u32,
+    ) -> anyhow::Result<()> {
+        self.mutate(|store| {
+            for id in note_ids {
+                store
+                    .notes
+                    .get_mut(id)
+                    .with_context(|| format!("Unknown note id {id}"))?
+                    .expanded_width = expanded_width;
+            }
+            store.linked_stack = Some(order);
+            Ok(())
+        })
+    }
+
     pub fn close(&self, id: &str) -> anyhow::Result<StoredNote> {
         let closed_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -713,6 +732,38 @@ mod tests {
             reloaded.linked_stack().unwrap(),
             repository.linked_stack().unwrap()
         );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn linked_arrangement_persists_widths_and_rolls_back_invalid_updates() {
+        let dir = temp_dir("linked-arrangement-widths");
+        let repository = NoteRepository::load_from_dir(&dir).unwrap();
+        let first = repository.all().unwrap()[0].clone();
+        let second = repository.create().unwrap();
+        let order = vec![second.id.clone(), first.id.clone()];
+
+        repository
+            .set_linked_stack_and_widths(order.clone(), &[first.id.clone()], 420)
+            .unwrap();
+        assert_eq!(repository.get(&first.id).unwrap().expanded_width, 420);
+        assert_eq!(repository.get(&second.id).unwrap().expanded_width, 300);
+        assert_eq!(repository.linked_stack().unwrap(), Some(order.clone()));
+
+        let invalid_ids = vec![second.id.clone(), "missing-note".to_string()];
+        assert!(repository
+            .set_linked_stack_and_widths(
+                vec![first.id.clone(), second.id.clone()],
+                &invalid_ids,
+                777,
+            )
+            .is_err());
+        assert_eq!(repository.get(&second.id).unwrap().expanded_width, 300);
+        assert_eq!(repository.linked_stack().unwrap(), Some(order.clone()));
+
+        let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
+        assert_eq!(reloaded.get(&first.id).unwrap().expanded_width, 420);
+        assert_eq!(reloaded.linked_stack().unwrap(), Some(order));
         cleanup(dir);
     }
 
