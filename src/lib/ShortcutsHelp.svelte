@@ -1,5 +1,6 @@
 <script lang="ts">
   import { webviewWindow } from "@tauri-apps/api";
+  import { onMount } from "svelte";
 
   const appWindow = webviewWindow.getCurrentWebviewWindow();
   const sections = [
@@ -10,7 +11,7 @@
         ["Close note", "⌘ W"],
         ["Reopen last closed note", "⇧ ⌘ T"],
         ["Restore all notes", "⇧ ⌘ U"],
-        ["Reset positions and unlink notes", "⇧ ⌘ R"],
+        ["Reset positions", "⇧ ⌘ R"],
         ["Hide or show all notes", "⇧ ⌘ H"],
         ["Quit Sticky", "⌘ Q"],
       ],
@@ -30,9 +31,7 @@
     {
       title: "Navigate & arrange",
       shortcuts: [
-        ["Focus next note", "⌘ /"],
-        ["Focus previous note", "⌥ ⌘ /"],
-        ["Link all notes to current note", "⇧ ⌘ L"],
+        ["Arrange notes on this side below current note", "⇧ ⌘ L"],
         ["Align with next note or screen edge", "⌥ ⌘ + Arrow"],
         ["Align with any nearby edge", "⇧ ⌥ ⌘ + Arrow"],
         ["Set color 1–7", "⌘ 1–7"],
@@ -41,17 +40,22 @@
   ];
 
   function closeOnEscape(event: KeyboardEvent) {
-    if (event.key === "Escape") void appWindow.close();
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    void appWindow.close();
   }
-</script>
 
-<svelte:window onkeydown={closeOnEscape} />
+  onMount(() => {
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
+  });
+</script>
 
 <main>
   <header>
     <div>
       <h1>Keyboard Shortcuts</h1>
-      <p>Press <kbd>F1</kbd> again or <kbd>Esc</kbd> to close.</p>
+      <p>Press <kbd>⌘ /</kbd> again or <kbd>Esc</kbd> to close.</p>
     </div>
     <button onclick={() => void appWindow.close()} aria-label="close keyboard shortcuts">
       Done

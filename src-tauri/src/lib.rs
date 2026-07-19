@@ -8,12 +8,14 @@ use crate::commands::*;
 use crate::menu::{create_menu, handle_menu_event};
 use crate::save_load::{load_settings, load_stickies, NoteRepository};
 use crate::settings::MenuSettings;
-use crate::windows::{focus_existing_or_create, DragCoordinator, NoteVisibility};
+use crate::updater::{check_for_update, launch_update};
+use crate::windows::{focus_existing_or_create, GeometryIndex, NoteVisibility};
 
 mod commands;
 mod menu;
 mod save_load;
 mod settings;
+mod updater;
 mod windows;
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
@@ -99,17 +101,19 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bring_all_to_front,
             start_window_drag,
-            finish_window_drag,
-            link_all_notes_to_current_note,
+            arrange_notes_on_this_side_below_current_note,
             create_note,
             save_note,
+            save_geometry,
             close_window,
             set_note_always_on_top,
             set_collapsed,
             acknowledge_quit,
+            check_for_update,
+            launch_update,
         ])
         .manage(QuitCoordinator::default())
-        .manage(DragCoordinator::default())
+        .manage(GeometryIndex::default())
         .manage(NoteVisibility::default())
         .setup(setup)
         .build(tauri::generate_context!())

@@ -16,7 +16,7 @@ That command handles everything and opens Sticky when it is done. The first inst
 
 ## Update
 
-Run the same command again. Your notes will not be replaced.
+In Sticky, choose **Help → Version…**. Sticky checks the current GitHub `main` commit only when that window opens. If a different build is available, click **Update**; the installation runs visibly in Terminal, then Sticky reopens when it is finished. Updating Sticky does not replace your notes.
 
 ## If macOS blocks Sticky
 
@@ -30,7 +30,7 @@ Sticky has no account, analytics, or cloud sync. Notes stay on your Mac in:
 ~/Library/Application Support/local.jian.mdsticky/
 ```
 
-Press `F1` inside Sticky to see its keyboard shortcuts.
+Press `Command-/` inside Sticky to see its keyboard shortcuts.
 
 ## Uninstall
 

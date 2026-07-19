@@ -17,10 +17,7 @@ use tauri_plugin_log::log;
 use tauri_plugin_store::StoreExt;
 use uuid::Uuid;
 
-use crate::{
-    settings::MenuSettings,
-    windows::{open_sticky, reflow_linked_stack},
-};
+use crate::{settings::MenuSettings, windows::open_sticky};
 
 const BACKUP_FOLDER: &str = "backups";
 const NOTES_DATA: &str = "notes.json";
@@ -96,8 +93,8 @@ impl StoredNote {
 struct NoteStore {
     version: u32,
     notes: BTreeMap<String, StoredNote>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    linked_stack: Option<Vec<String>>,
+    #[serde(default, rename = "linked_stack", skip_serializing)]
+    _legacy_linked_stack: Option<Value>,
 }
 
 impl NoteStore {
@@ -105,7 +102,7 @@ impl NoteStore {
         Self {
             version: STORAGE_VERSION,
             notes: BTreeMap::new(),
-            linked_stack: None,
+            _legacy_linked_stack: None,
         }
     }
 
@@ -118,29 +115,17 @@ impl NoteStore {
 
     fn add_recovery_notice(&mut self, restored_previous: bool) {
         let note = StoredNote::recovery_notice(restored_previous);
-        if let Some(order) = &mut self.linked_stack {
-            order.push(note.id.clone());
-        }
         self.notes.insert(note.id.clone(), note);
     }
 
     fn ordered_notes(&self) -> Vec<StoredNote> {
-        let Some(order) = &self.linked_stack else {
-            return self.notes.values().cloned().collect();
-        };
-        order
-            .iter()
-            .filter_map(|id| self.notes.get(id).cloned())
-            .collect()
+        self.notes.values().cloned().collect()
     }
 
     fn purge_archived_before(&mut self, cutoff: u64) -> usize {
         let previous_count = self.notes.len();
         self.notes
             .retain(|_, note| note.closed_at.is_none_or(|closed_at| closed_at >= cutoff));
-        if let Some(order) = &mut self.linked_stack {
-            order.retain(|id| self.notes.contains_key(id));
-        }
         previous_count - self.notes.len()
     }
 }
@@ -241,9 +226,6 @@ impl NoteRepository {
         note.y = y;
         let result = note.clone();
         self.mutate(|store| {
-            if let Some(order) = &mut store.linked_stack {
-                order.push(note.id.clone());
-            }
             store.notes.insert(note.id.clone(), note);
             Ok(())
         })?;
@@ -270,53 +252,11 @@ impl NoteRepository {
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
         self.mutate(|store| {
             store.notes.remove(id);
-            if let Some(order) = &mut store.linked_stack {
-                order.retain(|note_id| note_id != id);
-            }
             Ok(())
         })
     }
 
-    pub fn linked_stack(&self) -> anyhow::Result<Option<Vec<String>>> {
-        let notes = self
-            .notes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Note storage lock poisoned"))?;
-        Ok(notes.linked_stack.clone())
-    }
-
-    pub fn set_linked_stack(&self, order: Option<Vec<String>>) -> anyhow::Result<()> {
-        self.mutate(|store| {
-            store.linked_stack = order;
-            Ok(())
-        })
-    }
-
-    pub fn set_linked_arrangement(
-        &self,
-        order: Vec<String>,
-        positions: &[(String, i32, i32)],
-        expanded_width: u32,
-    ) -> anyhow::Result<()> {
-        self.mutate(|store| {
-            for (id, x, y) in positions {
-                let note = store
-                    .notes
-                    .get_mut(id)
-                    .with_context(|| format!("Unknown note id {id}"))?;
-                note.expanded_width = expanded_width;
-                note.x = *x;
-                note.y = *y;
-            }
-            store.linked_stack = Some(order);
-            Ok(())
-        })
-    }
-
-    pub fn clear_linked_stack_and_set_positions(
-        &self,
-        positions: &[(String, i32, i32)],
-    ) -> anyhow::Result<()> {
+    pub fn set_positions(&self, positions: &[(String, i32, i32)]) -> anyhow::Result<()> {
         self.mutate(|store| {
             for (id, x, y) in positions {
                 let note = store
@@ -326,8 +266,38 @@ impl NoteRepository {
                 note.x = *x;
                 note.y = *y;
             }
-            store.linked_stack = None;
             Ok(())
+        })
+    }
+
+    pub fn update_geometry_if_changed(
+        &self,
+        id: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<bool> {
+        self.mutate_if_changed(|store| {
+            let note = store
+                .notes
+                .get_mut(id)
+                .with_context(|| format!("Unknown note id {id}"))?;
+            let width = width.max(150);
+            let height = height.max(80);
+            let changed = note.x != x
+                || note.y != y
+                || (!note.collapsed
+                    && (note.expanded_width != width || note.expanded_height != height));
+            if changed {
+                note.x = x;
+                note.y = y;
+                if !note.collapsed {
+                    note.expanded_width = width;
+                    note.expanded_height = height;
+                }
+            }
+            Ok(changed)
         })
     }
 
@@ -373,16 +343,29 @@ impl NoteRepository {
     where
         F: FnOnce(&mut NoteStore) -> anyhow::Result<()>,
     {
+        self.mutate_if_changed(|store| {
+            update(store)?;
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    fn mutate_if_changed<F>(&self, update: F) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&mut NoteStore) -> anyhow::Result<bool>,
+    {
         let mut guard = self
             .notes
             .lock()
             .map_err(|_| anyhow::anyhow!("Note storage lock poisoned"))?;
         let mut candidate = guard.clone();
-        update(&mut candidate)?;
+        if !update(&mut candidate)? {
+            return Ok(false);
+        }
         validate_store(&candidate)?;
         persist_store(&self.path, &self.previous_path, &candidate, true)?;
         *guard = candidate;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -416,16 +399,6 @@ fn validate_store(store: &NoteStore) -> anyhow::Result<()> {
         }
         if note.document.get("type").and_then(Value::as_str) != Some("doc") {
             bail!("Note {} did not contain a Tiptap document", note.id);
-        }
-    }
-    if let Some(order) = &store.linked_stack {
-        let unique: std::collections::BTreeSet<_> = order.iter().collect();
-        if unique.len() != order.len() {
-            bail!("Linked note stack contained duplicate note ids");
-        }
-        if order.len() != store.notes.len() || order.iter().any(|id| !store.notes.contains_key(id))
-        {
-            bail!("Linked note stack did not contain every stored note exactly once");
         }
     }
     Ok(())
@@ -590,11 +563,10 @@ pub fn load_stickies(app: &AppHandle) -> anyhow::Result<()> {
     let repository = app.state::<NoteRepository>();
     let active = repository.active()?;
     for note in &active {
-        if let Err(error) = open_sticky(app, &note) {
+        if let Err(error) = open_sticky(app, note) {
             log::error!("Could not open note {}: {error:#}", note.id);
         }
     }
-    reflow_linked_stack(app)?;
     if let Some(note) = active.iter().find(|note| !note.collapsed) {
         if let Some(window) = app.get_webview_window(&format!("sticky_{}", note.id)) {
             window.set_focus()?;
@@ -748,13 +720,6 @@ mod tests {
         let active = repository.all().unwrap()[0].clone();
         let recent = repository.create().unwrap();
         let expired = repository.create().unwrap();
-        repository
-            .set_linked_stack(Some(vec![
-                active.id.clone(),
-                recent.id.clone(),
-                expired.id.clone(),
-            ]))
-            .unwrap();
         let now = current_time_millis().unwrap();
         repository
             .update(&recent.id, |note| {
@@ -772,115 +737,34 @@ mod tests {
 
         let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
         assert!(reloaded.get(&expired.id).is_err());
-        assert_eq!(
-            reloaded.linked_stack().unwrap().unwrap(),
-            vec![active.id.clone(), recent.id.clone()]
-        );
         assert_eq!(reloaded.restore_all_closed().unwrap(), 1);
+        let active_ids: std::collections::BTreeSet<_> = reloaded
+            .active()
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
         assert_eq!(
-            reloaded
-                .active()
-                .unwrap()
-                .into_iter()
-                .map(|note| note.id)
-                .collect::<Vec<_>>(),
-            vec![active.id, recent.id]
+            active_ids,
+            std::collections::BTreeSet::from([active.id, recent.id])
         );
         cleanup(dir);
     }
 
     #[test]
-    fn linked_order_survives_close_restore_and_appends_new_notes() {
-        let dir = temp_dir("linked-order-lifecycle");
+    fn position_updates_are_atomic_and_preserve_note_sizes() {
+        let dir = temp_dir("position-update");
         let repository = NoteRepository::load_from_dir(&dir).unwrap();
         let first = repository.all().unwrap()[0].clone();
         let second = repository.create().unwrap();
-        let third = repository.create().unwrap();
-        repository
-            .set_linked_stack(Some(vec![
-                third.id.clone(),
-                first.id.clone(),
-                second.id.clone(),
-            ]))
-            .unwrap();
-
-        repository.close(&first.id).unwrap();
-        assert_eq!(
-            repository
-                .active()
-                .unwrap()
-                .into_iter()
-                .map(|note| note.id)
-                .collect::<Vec<_>>(),
-            vec![third.id.clone(), second.id.clone()]
-        );
-        repository.restore_last_closed().unwrap();
-        assert_eq!(
-            repository
-                .active()
-                .unwrap()
-                .into_iter()
-                .map(|note| note.id)
-                .collect::<Vec<_>>(),
-            vec![third.id.clone(), first.id.clone(), second.id.clone()]
-        );
-
-        let fourth = repository.create().unwrap();
-        assert_eq!(
-            repository.linked_stack().unwrap().unwrap(),
-            vec![third.id, first.id, second.id, fourth.id]
-        );
-        let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
-        assert_eq!(
-            reloaded.linked_stack().unwrap(),
-            repository.linked_stack().unwrap()
-        );
-        cleanup(dir);
-    }
-
-    #[test]
-    fn reset_positions_clears_link_without_restoring_archived_notes() {
-        let dir = temp_dir("reset-unlinks");
-        let repository = NoteRepository::load_from_dir(&dir).unwrap();
-        let active = repository.all().unwrap()[0].clone();
-        let archived = repository.create().unwrap();
-        repository
-            .set_linked_stack(Some(vec![active.id.clone(), archived.id.clone()]))
-            .unwrap();
-        repository.close(&archived.id).unwrap();
 
         repository
-            .clear_linked_stack_and_set_positions(&[(active.id.clone(), 20, 40)])
+            .set_positions(&[(first.id.clone(), 40, 50), (second.id.clone(), 40, 312)])
             .unwrap();
-
-        assert_eq!(repository.linked_stack().unwrap(), None);
         assert_eq!(
-            (
-                repository.get(&active.id).unwrap().x,
-                repository.get(&active.id).unwrap().y
-            ),
-            (20, 40)
+            repository.get(&first.id).unwrap().expanded_width,
+            first.expanded_width
         );
-        assert!(repository.get(&archived.id).unwrap().closed_at.is_some());
-        cleanup(dir);
-    }
-
-    #[test]
-    fn linked_arrangement_persists_order_widths_and_positions_atomically() {
-        let dir = temp_dir("linked-arrangement");
-        let repository = NoteRepository::load_from_dir(&dir).unwrap();
-        let first = repository.all().unwrap()[0].clone();
-        let second = repository.create().unwrap();
-        let order = vec![second.id.clone(), first.id.clone()];
-
-        repository
-            .set_linked_arrangement(
-                order.clone(),
-                &[(first.id.clone(), 40, 50), (second.id.clone(), 40, 312)],
-                300,
-            )
-            .unwrap();
-        assert_eq!(repository.get(&first.id).unwrap().expanded_width, 300);
         assert_eq!(
             (
                 repository.get(&first.id).unwrap().x,
@@ -888,7 +772,10 @@ mod tests {
             ),
             (40, 50)
         );
-        assert_eq!(repository.get(&second.id).unwrap().expanded_width, 300);
+        assert_eq!(
+            repository.get(&second.id).unwrap().expanded_width,
+            second.expanded_width
+        );
         assert_eq!(
             (
                 repository.get(&second.id).unwrap().x,
@@ -896,19 +783,12 @@ mod tests {
             ),
             (40, 312)
         );
-        assert_eq!(repository.linked_stack().unwrap(), Some(order.clone()));
-
         assert!(repository
-            .set_linked_arrangement(
-                vec![first.id.clone(), second.id.clone()],
-                &[
-                    (second.id.clone(), 900, 901),
-                    ("missing-note".to_string(), 1, 2)
-                ],
-                777,
-            )
+            .set_positions(&[
+                (second.id.clone(), 900, 901),
+                ("missing-note".to_string(), 1, 2)
+            ])
             .is_err());
-        assert_eq!(repository.get(&second.id).unwrap().expanded_width, 300);
         assert_eq!(
             (
                 repository.get(&second.id).unwrap().x,
@@ -916,10 +796,11 @@ mod tests {
             ),
             (40, 312)
         );
-        assert_eq!(repository.linked_stack().unwrap(), Some(order.clone()));
-
         let reloaded = NoteRepository::load_from_dir(&dir).unwrap();
-        assert_eq!(reloaded.get(&first.id).unwrap().expanded_width, 300);
+        assert_eq!(
+            reloaded.get(&first.id).unwrap().expanded_width,
+            first.expanded_width
+        );
         assert_eq!(
             (
                 reloaded.get(&first.id).unwrap().x,
@@ -927,7 +808,80 @@ mod tests {
             ),
             (40, 50)
         );
-        assert_eq!(reloaded.linked_stack().unwrap(), Some(order));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn legacy_linked_stack_is_ignored_and_removed_by_the_next_save() {
+        let dir = temp_dir("legacy-linked-stack");
+        let archived_at = current_time_millis().unwrap();
+        let legacy_store = json!({
+            "version": STORAGE_VERSION,
+            "linked_stack": ["b", "a"],
+            "notes": {
+                "a": {
+                    "id": "a",
+                    "document": document("alpha"),
+                    "color": "#fff9b1",
+                    "x": 11,
+                    "y": 22,
+                    "expanded_height": 333,
+                    "expanded_width": 444,
+                    "collapsed": false,
+                    "pinned": true
+                },
+                "b": {
+                    "id": "b",
+                    "document": document("beta"),
+                    "color": "#81b7dd",
+                    "x": -55,
+                    "y": 66,
+                    "expanded_height": 177,
+                    "expanded_width": 288,
+                    "collapsed": true,
+                    "pinned": false,
+                    "closed_at": archived_at
+                }
+            }
+        });
+        fs::write(
+            dir.join(NOTES_DATA),
+            serde_json::to_vec_pretty(&legacy_store).unwrap(),
+        )
+        .unwrap();
+
+        let repository = NoteRepository::load_from_dir(&dir).unwrap();
+        let notes = repository.all().unwrap();
+        assert_eq!(
+            notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!((notes[0].x, notes[0].y), (11, 22));
+        assert_eq!(
+            (notes[0].expanded_width, notes[0].expanded_height),
+            (444, 333)
+        );
+        assert_eq!(notes[0].document, document("alpha"));
+        assert_eq!((notes[1].x, notes[1].y), (-55, 66));
+        assert_eq!(
+            (notes[1].expanded_width, notes[1].expanded_height),
+            (288, 177)
+        );
+        assert_eq!(notes[1].closed_at, Some(archived_at));
+
+        repository
+            .update("a", |note| {
+                note.color = "#65a65b".into();
+                Ok(())
+            })
+            .unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(dir.join(NOTES_DATA)).unwrap()).unwrap();
+        assert!(saved.get("linked_stack").is_none());
+        assert_eq!(repository.get("b").unwrap().document, document("beta"));
         cleanup(dir);
     }
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import {
+    mdiAlignVerticalDistribute,
     mdiClose,
-    mdiLinkVariant,
     mdiPalette,
     mdiPin,
     mdiPinOff,
@@ -13,6 +13,7 @@
   import Editor from "$lib/Editor.svelte";
   import Icon from "$lib/Icon.svelte";
   import ShortcutsHelp from "$lib/ShortcutsHelp.svelte";
+  import Version from "$lib/Version.svelte";
 
   interface StickyInit {
     always_on_top?: boolean;
@@ -32,13 +33,16 @@
   const shortcutsWindow = Boolean(
     (window as typeof window & { __SHORTCUTS__?: boolean }).__SHORTCUTS__,
   );
+  const versionWindow = Boolean(
+    (window as typeof window & { __VERSION_INIT__?: object }).__VERSION_INIT__,
+  );
 
   let editor = $state<Editor>();
   let colorMenuOpen = $state(false);
   let titlebarHovered = $state(false);
   let alwaysOnTop = $state(false);
   let collapsed = $state(false);
-  let stackBusy = $state(false);
+  let arrangementBusy = $state(false);
   let noteTitle = $state("Empty Note");
   let moveTimer: number | undefined;
   const unlisteners: Array<() => void> = [];
@@ -49,14 +53,14 @@
     await invoke("set_note_always_on_top", { alwaysOnTop });
   }
 
-  async function linkAllNotes() {
-    if (stackBusy) return;
-    stackBusy = true;
+  async function arrangeNotesOnThisSide() {
+    if (arrangementBusy) return;
+    arrangementBusy = true;
     try {
       await editor?.flushSave();
-      await invoke("link_all_notes_to_current_note");
+      await invoke("arrange_notes_on_this_side_below_current_note");
     } finally {
-      stackBusy = false;
+      arrangementBusy = false;
     }
   }
 
@@ -86,11 +90,10 @@
 
   function saveGeometryDebounced() {
     if (moveTimer !== undefined) window.clearTimeout(moveTimer);
-    moveTimer = window.setTimeout(() => void editor?.flushSave(), 150);
-  }
-
-  function finishWindowDrag() {
-    void invoke("finish_window_drag");
+    moveTimer = window.setTimeout(() => {
+      moveTimer = undefined;
+      void invoke("save_geometry");
+    }, 150);
   }
 
   function createNoteWithControlN(event: KeyboardEvent) {
@@ -108,7 +111,7 @@
   }
 
   onMount(async () => {
-    if (shortcutsWindow) return;
+    if (shortcutsWindow || versionWindow) return;
     const init = (window as typeof window & { __STICKY_INIT__?: StickyInit })
       .__STICKY_INIT__;
     alwaysOnTop = init?.always_on_top ?? false;
@@ -116,7 +119,6 @@
 
     if (!init) document.body.classList.add("focused");
     window.addEventListener("keydown", createNoteWithControlN, true);
-    window.addEventListener("mouseup", finishWindowDrag, true);
 
     unlisteners.push(
       await appWindow.listen("tauri://focus", async () => {
@@ -142,13 +144,14 @@
   onDestroy(() => {
     if (moveTimer !== undefined) window.clearTimeout(moveTimer);
     window.removeEventListener("keydown", createNoteWithControlN, true);
-    window.removeEventListener("mouseup", finishWindowDrag, true);
     unlisteners.forEach((unlisten) => unlisten());
   });
 </script>
 
 {#if shortcutsWindow}
   <ShortcutsHelp />
+{:else if versionWindow}
+  <Version />
 {:else}
   <div class="titlebar" class:hover={titlebarHovered} class:collapsed>
   <div
@@ -193,15 +196,15 @@
     </button>
     <button
       class="titlebar-button"
-      disabled={stackBusy}
+      disabled={arrangementBusy}
       onclick={(event) => {
         event.stopPropagation();
-        void linkAllNotes();
+        void arrangeNotesOnThisSide();
       }}
-      aria-label="Link all notes to this note."
-      title="Link all notes to this note."
+      aria-label="Arrange notes on this side below this note."
+      title="Arrange notes on this side below this note."
     >
-      <Icon path={mdiLinkVariant} size={11} />
+      <Icon path={mdiAlignVerticalDistribute} size={11} />
     </button>
     <button
       class="titlebar-button"

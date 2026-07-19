@@ -96,6 +96,10 @@
       extensions: createEditorExtensions(),
       content: init?.document ?? { type: "doc", content: [{ type: "paragraph" }] },
       editorProps: {
+        attributes: {
+          autocorrect: "off",
+          spellcheck: "false",
+        },
         handleDOMEvents: {
           focusin: (view, event) => {
             const target = event.target;
