@@ -89,12 +89,17 @@ button {
   margin: 0.75em 0;
 }
 
+.editor .tiptap ul:not([data-type="taskList"]),
+.editor .tiptap ol {
+  padding-left: 1.45em;
+}
+
 .editor .tiptap ul[data-type="taskList"] {
   list-style: none;
   padding-left: 0;
 }
 
-.editor .tiptap ul[data-type="taskList"] li {
+.editor .tiptap ul[data-type="taskList"] > li {
   align-items: flex-start;
   display: flex;
   gap: 0.45em;
