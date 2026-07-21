@@ -36,7 +36,7 @@ pub struct NoteGeometry {
 #[derive(Default)]
 pub struct GeometryIndex(Mutex<HashMap<String, NoteGeometry>>);
 
-pub fn apply_note_pin_state(window: &WebviewWindow, pinned: bool) -> anyhow::Result<()> {
+pub fn apply_window_pin_state(window: &WebviewWindow, pinned: bool) -> anyhow::Result<()> {
     window.set_always_on_top(pinned)?;
 
     #[cfg(target_os = "macos")]
@@ -75,7 +75,7 @@ impl GeometryIndex {
             .map_err(|_| anyhow::anyhow!("Geometry index lock poisoned"))?
             .get(id)
             .copied()
-            .with_context(|| format!("No live geometry for note {id}"))
+            .with_context(|| format!("No live geometry for window {id}"))
     }
 
     pub(crate) fn set_position(
@@ -89,7 +89,7 @@ impl GeometryIndex {
             .map_err(|_| anyhow::anyhow!("Geometry index lock poisoned"))?;
         let geometry = geometries
             .get_mut(id)
-            .with_context(|| format!("No live geometry for note {id}"))?;
+            .with_context(|| format!("No live geometry for window {id}"))?;
         geometry.position = position;
         Ok(())
     }
@@ -101,12 +101,12 @@ impl GeometryIndex {
             .map_err(|_| anyhow::anyhow!("Geometry index lock poisoned"))?;
         let geometry = geometries
             .get_mut(id)
-            .with_context(|| format!("No live geometry for note {id}"))?;
+            .with_context(|| format!("No live geometry for window {id}"))?;
         geometry.size = size;
         Ok(())
     }
 
-    fn record_window_event(&self, id: &str, event: &WindowEvent) -> anyhow::Result<()> {
+    pub(crate) fn record_window_event(&self, id: &str, event: &WindowEvent) -> anyhow::Result<()> {
         match event {
             WindowEvent::Moved(position) => self.set_position(id, *position),
             WindowEvent::Resized(size) => self.set_size(id, *size),
@@ -601,7 +601,7 @@ pub fn open_sticky(app: &AppHandle, note: &StoredNote) -> Result<WebviewWindow, 
         }
     });
 
-    apply_note_pin_state(&window, note.pinned)?;
+    apply_window_pin_state(&window, note.pinned)?;
     if let Err(error) = sync_pinned_window_registry(app, None) {
         log::error!(
             "Could not register pin state for opened note {}: {error:#}",
@@ -612,12 +612,23 @@ pub fn open_sticky(app: &AppHandle, note: &StoredNote) -> Result<WebviewWindow, 
     Ok(window)
 }
 
-pub fn request_close_sticky(app: &AppHandle) -> Result<(), anyhow::Error> {
-    if let Some(window) = app.get_webview_window(SHORTCUTS_WINDOW_LABEL) {
-        if window.is_focused()? {
-            window.close()?;
-            return Ok(());
+pub fn request_close_window(app: &AppHandle) -> Result<(), anyhow::Error> {
+    for label in [SHORTCUTS_WINDOW_LABEL, VERSION_WINDOW_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            if window.is_focused()? {
+                window.close()?;
+                return Ok(());
+            }
         }
+    }
+    if let Some(window) = app
+        .webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            (label.starts_with("timer_") && window.is_focused().unwrap_or(false)).then_some(window)
+        })
+    {
+        return crate::groups::close_window(&window);
     }
     if let Some(window) = get_focused_window(app) {
         window.emit_to(
@@ -855,6 +866,7 @@ pub fn cycle_focus(app: &AppHandle, reverse: bool) -> Result<(), anyhow::Error> 
 pub fn set_color(app: &AppHandle, index: u8) -> Result<(), anyhow::Error> {
     app.webview_windows()
         .into_iter()
+        .filter(|(label, _)| label.starts_with("sticky_"))
         .for_each(|(label, window)| {
             if window.is_focused().unwrap_or(false) {
                 log::info!("emitting set color to window {}", label);

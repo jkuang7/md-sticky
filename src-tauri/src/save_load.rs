@@ -26,7 +26,7 @@ const BACKUP_FOLDER: &str = "backups";
 const NOTES_DATA: &str = "notes.json";
 const PREVIOUS_NOTES_DATA: &str = "notes.previous.json";
 const SETTINGS: &str = "settings";
-const STORAGE_VERSION: u32 = 3;
+const STORAGE_VERSION: u32 = 4;
 const ARCHIVE_RETENTION_MILLIS: u64 = 30 * 24 * 60 * 60 * 1_000;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -95,10 +95,67 @@ impl StoredNote {
     }
 }
 
+#[derive(
+    serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupMemberKind {
+    Note,
+    Timer,
+}
+
+#[derive(
+    serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+pub struct StoredGroupMember {
+    pub kind: GroupMemberKind,
+    pub id: String,
+}
+
+impl StoredGroupMember {
+    pub fn note(id: impl Into<String>) -> Self {
+        Self {
+            kind: GroupMemberKind::Note,
+            id: id.into(),
+        }
+    }
+
+    pub fn timer(id: impl Into<String>) -> Self {
+        Self {
+            kind: GroupMemberKind::Timer,
+            id: id.into(),
+        }
+    }
+
+    pub fn from_window_label(label: &str) -> anyhow::Result<Self> {
+        if let Some(id) = label.strip_prefix("sticky_") {
+            return Ok(Self::note(id));
+        }
+        if let Some(id) = label.strip_prefix("timer_") {
+            return Ok(Self::timer(id));
+        }
+        bail!("Window label did not identify a note or timer")
+    }
+
+    pub fn window_label(&self) -> String {
+        match self.kind {
+            GroupMemberKind::Note => format!("sticky_{}", self.id),
+            GroupMemberKind::Timer => format!("timer_{}", self.id),
+        }
+    }
+
+    pub fn runtime_key(&self) -> String {
+        match self.kind {
+            GroupMemberKind::Note => format!("note:{}", self.id),
+            GroupMemberKind::Timer => format!("timer:{}", self.id),
+        }
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct StoredGroup {
     pub id: String,
-    pub note_ids: Vec<String>,
+    pub members: Vec<StoredGroupMember>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq)]
@@ -147,9 +204,11 @@ impl NoteStore {
 
     fn normalize_groups(&mut self) {
         for group in self.groups.values_mut() {
-            group.note_ids.retain(|id| self.notes.contains_key(id));
+            group.members.retain(|member| {
+                member.kind == GroupMemberKind::Timer || self.notes.contains_key(&member.id)
+            });
         }
-        self.groups.retain(|_, group| group.note_ids.len() >= 2);
+        self.groups.retain(|_, group| group.members.len() >= 2);
     }
 }
 
@@ -243,7 +302,10 @@ impl NoteRepository {
             .with_context(|| format!("Unknown note id {id}"))
     }
 
-    pub fn group_for_note(&self, note_id: &str) -> anyhow::Result<Option<StoredGroup>> {
+    pub fn group_for_member(
+        &self,
+        member: &StoredGroupMember,
+    ) -> anyhow::Result<Option<StoredGroup>> {
         let store = self
             .notes
             .lock()
@@ -251,8 +313,29 @@ impl NoteRepository {
         Ok(store
             .groups
             .values()
-            .find(|group| group.note_ids.iter().any(|id| id == note_id))
+            .find(|group| group.members.iter().any(|candidate| candidate == member))
             .cloned())
+    }
+
+    pub fn group_for_note(&self, note_id: &str) -> anyhow::Result<Option<StoredGroup>> {
+        self.group_for_member(&StoredGroupMember::note(note_id))
+    }
+
+    pub fn prune_missing_timers(
+        &self,
+        timer_ids: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        self.mutate_if_changed(|store| {
+            let before = store.groups.clone();
+            for group in store.groups.values_mut() {
+                group.members.retain(|member| {
+                    member.kind != GroupMemberKind::Timer || timer_ids.contains(&member.id)
+                });
+            }
+            store.groups.retain(|_, group| group.members.len() >= 2);
+            Ok(store.groups != before)
+        })?;
+        Ok(())
     }
 
     pub fn all_groups(&self) -> anyhow::Result<Vec<StoredGroup>> {
@@ -322,62 +405,6 @@ impl NoteRepository {
                 note.y = *y;
             }
             Ok(())
-        })
-    }
-
-    pub fn update_geometry_if_changed(
-        &self,
-        id: &str,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<bool> {
-        self.mutate_if_changed(|store| {
-            let note = store
-                .notes
-                .get_mut(id)
-                .with_context(|| format!("Unknown note id {id}"))?;
-            let width = width.max(150);
-            let height = height.max(80);
-            let changed = note.x != x
-                || note.y != y
-                || (!note.collapsed
-                    && (note.expanded_width != width || note.expanded_height != height));
-            if changed {
-                note.x = x;
-                note.y = y;
-                if !note.collapsed {
-                    note.expanded_width = width;
-                    note.expanded_height = height;
-                }
-            }
-            Ok(changed)
-        })
-    }
-
-    pub fn update_size_if_changed(
-        &self,
-        id: &str,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<bool> {
-        self.mutate_if_changed(|store| {
-            let note = store
-                .notes
-                .get_mut(id)
-                .with_context(|| format!("Unknown note id {id}"))?;
-            if note.collapsed {
-                return Ok(false);
-            }
-            let width = width.max(150);
-            let height = height.max(80);
-            let changed = note.expanded_width != width || note.expanded_height != height;
-            if changed {
-                note.expanded_width = width;
-                note.expanded_height = height;
-            }
-            Ok(changed)
         })
     }
 
@@ -492,6 +519,30 @@ fn parse_store(bytes: &[u8]) -> anyhow::Result<NoteStore> {
         }
         object.remove("linked_stack");
     }
+    if matches!(version, Some(1..=3)) {
+        let object = value
+            .as_object_mut()
+            .context("Note storage root was not an object")?;
+        object.insert("version".into(), Value::from(STORAGE_VERSION));
+        if let Some(groups) = object.get_mut("groups").and_then(Value::as_object_mut) {
+            for group in groups.values_mut().filter_map(Value::as_object_mut) {
+                if let Some(note_ids) = group.remove("note_ids") {
+                    let members = note_ids
+                        .as_array()
+                        .context("Legacy group note_ids was not an array")?
+                        .iter()
+                        .map(|id| {
+                            Ok(json!({
+                                "kind": "note",
+                                "id": id.as_str().context("Legacy group note id was not a string")?
+                            }))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    group.insert("members".into(), Value::Array(members));
+                }
+            }
+        }
+    }
     let store: NoteStore = serde_json::from_value(value).context("Failed to parse note storage")?;
     validate_store(&store)?;
     Ok(store)
@@ -522,19 +573,22 @@ fn validate_store(store: &NoteStore) -> anyhow::Result<()> {
         if key != &group.id {
             bail!("Group map key did not match the stored group id");
         }
-        if group.note_ids.len() < 2 {
-            bail!("Group {} contained fewer than two notes", group.id);
+        if group.members.len() < 2 {
+            bail!("Group {} contained fewer than two windows", group.id);
         }
         let mut local = std::collections::HashSet::new();
-        for note_id in &group.note_ids {
-            if !store.notes.contains_key(note_id) {
-                bail!("Group {} referenced missing note {note_id}", group.id);
+        for member in &group.members {
+            if member.id.is_empty() {
+                bail!("Group {} contained an empty member id", group.id);
             }
-            if !local.insert(note_id) {
-                bail!("Group {} contained duplicate note {note_id}", group.id);
+            if member.kind == GroupMemberKind::Note && !store.notes.contains_key(&member.id) {
+                bail!("Group {} referenced missing note {}", group.id, member.id);
             }
-            if !memberships.insert(note_id) {
-                bail!("Note {note_id} belonged to more than one group");
+            if !local.insert(member) {
+                bail!("Group {} contained a duplicate window", group.id);
+            }
+            if !memberships.insert(member) {
+                bail!("A window belonged to more than one group");
             }
         }
     }
@@ -955,27 +1009,6 @@ mod tests {
     }
 
     #[test]
-    fn native_size_settlement_never_overwrites_durable_position() {
-        let dir = temp_dir("size-only-update");
-        let repository = NoteRepository::load_from_dir(&dir).unwrap();
-        let note = repository.all().unwrap()[0].clone();
-        repository
-            .set_positions(&[(note.id.clone(), 3019, 147)])
-            .unwrap();
-
-        assert!(repository
-            .update_size_if_changed(&note.id, 420, 360)
-            .unwrap());
-        let updated = repository.get(&note.id).unwrap();
-        assert_eq!((updated.x, updated.y), (3019, 147));
-        assert_eq!(
-            (updated.expanded_width, updated.expanded_height),
-            (420, 360)
-        );
-        cleanup(dir);
-    }
-
-    #[test]
     fn removed_stack_metadata_is_ignored_and_removed_by_the_next_save() {
         let dir = temp_dir("removed-stack-metadata");
         let archived_at = current_time_millis().unwrap();
@@ -1122,7 +1155,49 @@ mod tests {
             repository.all_groups().unwrap(),
             vec![StoredGroup {
                 id: "old-stack".into(),
-                note_ids: vec![second.id, first.id],
+                members: vec![
+                    StoredGroupMember::note(second.id),
+                    StoredGroupMember::note(first.id),
+                ],
+            }]
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn version_three_note_groups_migrate_to_typed_members_in_order() {
+        let dir = temp_dir("group-v3-migration");
+        let first = StoredNote::new();
+        let second = StoredNote::new();
+        let notes = BTreeMap::from([
+            (first.id.clone(), first.clone()),
+            (second.id.clone(), second.clone()),
+        ]);
+        fs::write(
+            dir.join(NOTES_DATA),
+            serde_json::to_vec_pretty(&json!({
+                "version": 3,
+                "notes": notes,
+                "groups": {
+                    "group": {
+                        "id": "group",
+                        "note_ids": [second.id.clone(), first.id.clone()]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let repository = NoteRepository::load_from_dir(&dir).unwrap();
+        assert_eq!(
+            repository.all_groups().unwrap(),
+            vec![StoredGroup {
+                id: "group".into(),
+                members: vec![
+                    StoredGroupMember::note(second.id),
+                    StoredGroupMember::note(first.id),
+                ],
             }]
         );
         cleanup(dir);
@@ -1137,7 +1212,11 @@ mod tests {
         let third = repository.create_with_font_size(DEFAULT_FONT_SIZE).unwrap();
         let group = StoredGroup {
             id: "group-a".into(),
-            note_ids: vec![second.id.clone(), first.id.clone(), third.id.clone()],
+            members: vec![
+                StoredGroupMember::note(&second.id),
+                StoredGroupMember::note(&first.id),
+                StoredGroupMember::note(&third.id),
+            ],
         };
         repository
             .mutate(|store| {
@@ -1168,7 +1247,10 @@ mod tests {
                     "one".into(),
                     StoredGroup {
                         id: "one".into(),
-                        note_ids: vec![first.id.clone(), second.id.clone()],
+                        members: vec![
+                            StoredGroupMember::note(&first.id),
+                            StoredGroupMember::note(&second.id),
+                        ],
                     },
                 );
                 Ok(())
@@ -1182,7 +1264,10 @@ mod tests {
                     "two".into(),
                     StoredGroup {
                         id: "two".into(),
-                        note_ids: vec![first.id.clone(), third.id.clone()],
+                        members: vec![
+                            StoredGroupMember::note(&first.id),
+                            StoredGroupMember::note(&third.id),
+                        ],
                     },
                 );
                 Ok(())
@@ -1205,7 +1290,10 @@ mod tests {
                     "one".into(),
                     StoredGroup {
                         id: "one".into(),
-                        note_ids: vec![first.id.clone(), second.id.clone()],
+                        members: vec![
+                            StoredGroupMember::note(&first.id),
+                            StoredGroupMember::note(&second.id),
+                        ],
                     },
                 );
                 Ok(())

@@ -7,12 +7,13 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_log::log;
 
 use crate::groups::{
-    link_notes_on_this_side_below_focused, reset_note_positions, unlink_group_for_focused,
+    link_windows_on_this_side_below_focused, reset_note_positions, unlink_group_for_focused,
 };
 use crate::save_load::save_settings;
 use crate::settings::MenuSettings;
+use crate::timers::create_timer_window;
 use crate::windows::{
-    change_focused_note_font_size, create_sticky, cycle_focus, request_close_sticky,
+    change_focused_note_font_size, create_sticky, cycle_focus, request_close_window,
     restore_all_notes, restore_last_closed, set_color, show_version_window, snap_window,
     toggle_note_visibility, toggle_shortcuts_window, Direction,
 };
@@ -20,11 +21,12 @@ use crate::windows::{
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
 pub enum MenuCommand {
     NewNote,
-    CloseNote,
+    NewTimer,
+    CloseWindow,
     ReopenClosedNote,
     RestoreAllNotes,
     ResetPositions,
-    LinkNotesOnThisSideBelowCurrent,
+    LinkWindowsOnThisSideBelowCurrent,
     UnlinkThisGroup,
     ToggleNoteVisibility,
     NextNote,
@@ -64,8 +66,8 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
             &PredefinedMenuItem::quit(app, None)?,
             &MenuItem::with_id(
                 app,
-                MenuCommand::CloseNote,
-                "Close Note",
+                MenuCommand::CloseWindow,
+                "Close Window",
                 true,
                 Some("Cmd+W"),
             )?,
@@ -86,6 +88,13 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
             &MenuItem::with_id(app, MenuCommand::NewNote, "New Note", true, Some("Cmd+N"))?,
             &MenuItem::with_id(
                 app,
+                MenuCommand::NewTimer,
+                "New Timer",
+                true,
+                Some("Cmd+Shift+N"),
+            )?,
+            &MenuItem::with_id(
+                app,
                 MenuCommand::ToggleNoteVisibility,
                 "Hide/Show All Notes",
                 true,
@@ -100,8 +109,8 @@ fn create_window_submenu(app: &AppHandle) -> Result<Submenu<Wry>, anyhow::Error>
             )?,
             &MenuItem::with_id(
                 app,
-                MenuCommand::LinkNotesOnThisSideBelowCurrent,
-                "Link Notes on This Side Below Current Note",
+                MenuCommand::LinkWindowsOnThisSideBelowCurrent,
+                "Relink All Windows on This Side Below Current Window",
                 true,
                 Some("Cmd+Shift+L"),
             )?,
@@ -303,14 +312,15 @@ pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
         Ok(command) => {
             if let Err(e) = match command {
                 MenuCommand::NewNote => create_sticky(app).map(|_| ()),
+                MenuCommand::NewTimer => create_timer_window(app).map(|_| ()),
                 MenuCommand::ResetPositions => reset_note_positions(app),
-                MenuCommand::LinkNotesOnThisSideBelowCurrent => {
-                    link_notes_on_this_side_below_focused(app)
+                MenuCommand::LinkWindowsOnThisSideBelowCurrent => {
+                    link_windows_on_this_side_below_focused(app)
                 }
                 MenuCommand::UnlinkThisGroup => unlink_group_for_focused(app),
                 MenuCommand::Snap(direction) => snap_window(app, direction, false),
                 MenuCommand::PartialSnap(direction) => snap_window(app, direction, true),
-                MenuCommand::CloseNote => request_close_sticky(app),
+                MenuCommand::CloseWindow => request_close_window(app),
                 MenuCommand::ReopenClosedNote => restore_last_closed(app),
                 MenuCommand::RestoreAllNotes => restore_all_notes(app),
                 MenuCommand::ToggleNoteVisibility => toggle_note_visibility(app),

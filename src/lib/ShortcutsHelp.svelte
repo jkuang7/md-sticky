@@ -8,7 +8,8 @@
       title: "Notes",
       shortcuts: [
         ["New note", "⌘ N"],
-        ["Close note", "⌘ W"],
+        ["New timer", "⇧ ⌘ N"],
+        ["Close window", "⌘ W"],
         ["Reopen last closed note", "⇧ ⌘ T"],
         ["Restore all notes", "⇧ ⌘ U"],
         ["Reset positions", "⇧ ⌘ R"],
@@ -33,7 +34,7 @@
     {
       title: "Navigate & link",
       shortcuts: [
-        ["Link notes on this side below current note", "⇧ ⌘ L"],
+        ["Relink all windows on this side below current window", "⇧ ⌘ L"],
         ["Align with next note or screen edge", "⌥ ⌘ + Arrow"],
         ["Align with any nearby edge", "⇧ ⌥ ⌘ + Arrow"],
         ["Set color 1–7", "⌘ 1–7"],

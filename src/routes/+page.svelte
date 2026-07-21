@@ -13,12 +13,23 @@
   import Editor from "$lib/Editor.svelte";
   import Icon from "$lib/Icon.svelte";
   import ShortcutsHelp from "$lib/ShortcutsHelp.svelte";
+  import Timer from "$lib/Timer.svelte";
   import Version from "$lib/Version.svelte";
 
   interface StickyInit {
     always_on_top?: boolean;
     collapsed?: boolean;
     font_size?: number;
+  }
+
+  interface TimerInit {
+    id: string;
+    elapsed_ms: number;
+    running: boolean;
+    reminder_interval_ms: number;
+    alarm_at_ms: number;
+    always_on_top: boolean;
+    collapsed: boolean;
   }
 
   const colors = [
@@ -37,6 +48,9 @@
   const versionWindow = Boolean(
     (window as typeof window & { __VERSION_INIT__?: object }).__VERSION_INIT__,
   );
+  const timerInit = (
+    window as typeof window & { __TIMER_INIT__?: TimerInit }
+  ).__TIMER_INIT__;
 
   let editor = $state<Editor>();
   let colorMenuOpen = $state(false);
@@ -71,7 +85,7 @@
     linkBusy = true;
     try {
       await editor?.flushSave();
-      await invoke("link_notes_on_this_side_below_current_note");
+      await invoke("link_windows_on_this_side_below_current_window");
     } finally {
       linkBusy = false;
     }
@@ -184,7 +198,7 @@
   }
 
   onMount(async () => {
-    if (shortcutsWindow || versionWindow) return;
+    if (shortcutsWindow || versionWindow || timerInit) return;
     const init = (window as typeof window & { __STICKY_INIT__?: StickyInit })
       .__STICKY_INIT__;
     alwaysOnTop = init?.always_on_top ?? false;
@@ -277,6 +291,8 @@
   <ShortcutsHelp />
 {:else if versionWindow}
   <Version />
+{:else if timerInit}
+  <Timer init={timerInit} />
 {:else}
   <div class="titlebar" class:hover={titlebarHovered} class:collapsed>
   <div
@@ -330,8 +346,8 @@
         event.stopPropagation();
         void linkNotesOnThisSide();
       }}
-      aria-label="Link notes on this side below this note."
-      title="Link independent notes on this side; drag a linked note to detach it."
+      aria-label="Make this note the parent and relink all windows on this side below it."
+      title="Make this the parent and relink all windows on this side below it."
     >
       <Icon path={mdiLinkVariant} size={12} />
     </button>

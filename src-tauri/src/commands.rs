@@ -5,14 +5,14 @@ use tauri::Manager;
 
 use crate::{
     groups::{
-        close_window_and_archive, link_notes_on_this_side_below,
+        close_window as close_surface_window, link_windows_on_this_side_below,
         resize_note_height as resize_native_note_height, run_window_drag, set_window_collapsed,
         settle_window_geometry, GroupRuntime,
     },
     pinned_windows::sync_pinned_window_registry,
     save_load::{note_id_from_label, NoteRepository},
     settings::MenuSettings,
-    windows::{apply_note_pin_state, change_note_font_size, create_sticky, sorted_windows},
+    windows::{apply_window_pin_state, change_note_font_size, create_sticky, sorted_windows},
 };
 
 const LEFT_MOUSE_BUTTON_MASK: usize = 1;
@@ -177,11 +177,11 @@ pub fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn link_notes_on_this_side_below_current_note(
+pub fn link_windows_on_this_side_below_current_window(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    link_notes_on_this_side_below(&app, &window).map_err(|error| error.to_string())
+    link_windows_on_this_side_below(&app, &window).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -207,7 +207,7 @@ pub fn create_note(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
-    close_window_and_archive(&window).map_err(|error| error.to_string())
+    close_surface_window(&window).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -257,12 +257,12 @@ pub fn set_note_always_on_top(
         .get(id)
         .map_err(|error| error.to_string())?
         .pinned;
-    apply_note_pin_state(&window, always_on_top).map_err(|error| error.to_string())?;
+    apply_window_pin_state(&window, always_on_top).map_err(|error| error.to_string())?;
     if let Err(error) = repository.update(id, |note| {
         note.pinned = always_on_top;
         Ok(())
     }) {
-        let _ = apply_note_pin_state(&window, previous);
+        let _ = apply_window_pin_state(&window, previous);
         return Err(error.to_string());
     }
     if let Err(error) = sync_pinned_window_registry(window.app_handle(), None) {
@@ -270,7 +270,7 @@ pub fn set_note_always_on_top(
             note.pinned = previous;
             Ok(())
         });
-        let native_rollback = apply_note_pin_state(&window, previous);
+        let native_rollback = apply_window_pin_state(&window, previous);
         rollback.map_err(|rollback| {
             format!("Could not roll back pin state after registry failure: {rollback:#}")
         })?;

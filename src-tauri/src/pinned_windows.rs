@@ -8,7 +8,10 @@ use std::{
 use anyhow::{bail, Context};
 use tauri::{AppHandle, Manager};
 
-use crate::save_load::{note_id_from_label, NoteRepository};
+use crate::{
+    save_load::{note_id_from_label, NoteRepository},
+    timers::{timer_id_from_label, timer_registry_identity, TimerRepository},
+};
 
 pub(crate) const PINNED_WINDOW_REGISTRY: &str = "aerospace-pinned-windows.tsv";
 const REGISTRY_HEADER: &str = "sticky-pinned-windows-v1";
@@ -19,11 +22,11 @@ fn serialize_registry(entries: &mut Vec<(i64, String)>) -> anyhow::Result<String
     entries.dedup();
 
     let mut registry = format!("{REGISTRY_HEADER}\n");
-    for (window_id, note_id) in entries {
-        if *window_id <= 0 || note_id.is_empty() || note_id.contains(['\t', '\r', '\n']) {
-            bail!("Invalid pinned-window registry entry for note {note_id:?}");
+    for (window_id, surface_id) in entries {
+        if *window_id <= 0 || surface_id.is_empty() || surface_id.contains(['\t', '\r', '\n']) {
+            bail!("Invalid pinned-window registry entry for surface {surface_id:?}");
         }
-        registry.push_str(&format!("{window_id}\t{note_id}\n"));
+        registry.push_str(&format!("{window_id}\t{surface_id}\n"));
     }
     Ok(registry)
 }
@@ -74,26 +77,37 @@ fn native_window_id(window: &tauri::WebviewWindow) -> anyhow::Result<i64> {
 
 pub(crate) fn sync_pinned_window_registry(
     app: &AppHandle,
-    excluded_note_id: Option<&str>,
+    excluded_surface_id: Option<&str>,
 ) -> anyhow::Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, excluded_note_id);
+        let _ = (app, excluded_surface_id);
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
-        let repository = app.state::<NoteRepository>();
+        let note_repository = app.state::<NoteRepository>();
+        let timer_repository = app.state::<TimerRepository>();
         let mut entries = Vec::new();
         for window in app.webview_windows().into_values() {
-            let Ok(note_id) = note_id_from_label(window.label()) else {
+            let surface_id = if let Ok(note_id) = note_id_from_label(window.label()) {
+                if !note_repository.get(note_id)?.pinned {
+                    continue;
+                }
+                note_id.to_string()
+            } else if let Ok(timer_id) = timer_id_from_label(window.label()) {
+                if !timer_repository.get(timer_id)?.pinned {
+                    continue;
+                }
+                timer_registry_identity(timer_id)
+            } else {
                 continue;
             };
-            if excluded_note_id == Some(note_id) || !repository.get(note_id)?.pinned {
+            if excluded_surface_id == Some(surface_id.as_str()) {
                 continue;
             }
-            entries.push((native_window_id(&window)?, note_id.to_string()));
+            entries.push((native_window_id(&window)?, surface_id));
         }
 
         let contents = serialize_registry(&mut entries)?;
@@ -112,14 +126,14 @@ mod tests {
     #[test]
     fn registry_is_versioned_sorted_and_deduplicated() {
         let mut entries = vec![
-            (42, "second".to_string()),
+            (42, "timer:second".to_string()),
             (7, "first".to_string()),
-            (42, "second".to_string()),
+            (42, "timer:second".to_string()),
         ];
 
         assert_eq!(
             serialize_registry(&mut entries).unwrap(),
-            "sticky-pinned-windows-v1\n7\tfirst\n42\tsecond\n"
+            "sticky-pinned-windows-v1\n7\tfirst\n42\ttimer:second\n"
         );
     }
 

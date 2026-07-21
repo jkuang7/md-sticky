@@ -10,7 +10,14 @@ use tauri::{
 use tauri_plugin_log::log;
 
 use crate::{
-    save_load::{current_time_millis, note_id_from_label, NoteRepository, StoredGroup, StoredNote},
+    save_load::{
+        current_time_millis, note_id_from_label, GroupMemberKind, NoteRepository, StoredGroup,
+        StoredGroupMember, StoredNote,
+    },
+    timers::{
+        close_timer, remove_timer_for_close, restore_timer_after_failed_close,
+        set_ungrouped_timer_collapsed, StoredTimer, TimerRepository, TIMER_HEIGHT, TIMER_WIDTH,
+    },
     windows::{
         close_ungrouped_window_and_archive, open_missing_active_notes, open_sticky,
         set_ungrouped_window_collapsed, sorted_windows, GeometryIndex, NoteGeometry,
@@ -45,7 +52,7 @@ impl GroupRuntimeState {
         let origin = self
             .drag_origins
             .remove(id)
-            .with_context(|| format!("No active drag origin for note {id}"))?;
+            .with_context(|| format!("No active drag origin for window {id}"))?;
         self.completed_drag_origins.insert(id.to_string(), origin);
         Ok(())
     }
@@ -72,7 +79,7 @@ impl GroupRuntime {
 }
 
 struct WindowSnapshot {
-    id: String,
+    member: StoredGroupMember,
     window: WebviewWindow,
     position: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
@@ -122,22 +129,27 @@ fn get_focused_window(app: &AppHandle) -> Option<WebviewWindow> {
     app.webview_windows()
         .into_iter()
         .find(|(label, window)| {
-            label.starts_with("sticky_") && window.is_focused().unwrap_or(false)
+            (label.starts_with("sticky_") || label.starts_with("timer_"))
+                && window.is_focused().unwrap_or(false)
         })
         .map(|(_, window)| window)
 }
 
-fn snapshots_for_ids(app: &AppHandle, ids: &[String]) -> anyhow::Result<Vec<WindowSnapshot>> {
+fn snapshots_for_members(
+    app: &AppHandle,
+    members: &[StoredGroupMember],
+) -> anyhow::Result<Vec<WindowSnapshot>> {
     let windows = app.webview_windows();
     let geometries = app.state::<GeometryIndex>();
-    ids.iter()
-        .map(|id| {
-            let window = windows
-                .get(&format!("sticky_{id}"))
-                .with_context(|| format!("Active note {id} did not have an open window"))?;
-            let geometry = geometries.get(id)?;
+    members
+        .iter()
+        .map(|member| {
+            let window = windows.get(&member.window_label()).with_context(|| {
+                format!("Active window {:?} did not have an open window", member)
+            })?;
+            let geometry = geometries.get(&member.id)?;
             Ok(WindowSnapshot {
-                id: id.clone(),
+                member: member.clone(),
                 window: window.clone(),
                 position: geometry.position,
                 size: geometry.size,
@@ -146,10 +158,13 @@ fn snapshots_for_ids(app: &AppHandle, ids: &[String]) -> anyhow::Result<Vec<Wind
         .collect()
 }
 
-fn visual_order(ids: &HashSet<String>, geometries: &GeometryIndex) -> anyhow::Result<Vec<String>> {
-    let mut ordered = ids
+fn visual_order(
+    members: &HashSet<StoredGroupMember>,
+    geometries: &GeometryIndex,
+) -> anyhow::Result<Vec<StoredGroupMember>> {
+    let mut ordered = members
         .iter()
-        .map(|id| Ok((id.clone(), geometries.get(id)?)))
+        .map(|member| Ok((member.clone(), geometries.get(&member.id)?)))
         .collect::<anyhow::Result<Vec<_>>>()?;
     ordered.sort_by(|a, b| {
         let a_position = a.1.position;
@@ -159,14 +174,14 @@ fn visual_order(ids: &HashSet<String>, geometries: &GeometryIndex) -> anyhow::Re
     Ok(ordered.into_iter().map(|(id, _)| id).collect())
 }
 
-fn ids_on_anchor_monitor_side(
-    anchor_id: &str,
-    candidate_ids: &[String],
+fn members_on_anchor_monitor_side(
+    anchor: &StoredGroupMember,
+    candidates: &[StoredGroupMember],
     geometries: &GeometryIndex,
     monitor: WindowRect,
     work_area: WindowRect,
-) -> anyhow::Result<Vec<String>> {
-    let anchor_geometry = geometries.get(anchor_id)?;
+) -> anyhow::Result<Vec<StoredGroupMember>> {
+    let anchor_geometry = geometries.get(&anchor.id)?;
     let anchor_center =
         WindowRect::from_physical(anchor_geometry.position, anchor_geometry.size).center_twice();
     if !monitor.contains_center_twice(anchor_center) {
@@ -175,14 +190,82 @@ fn ids_on_anchor_monitor_side(
     let midpoint_twice = 2 * work_area.x + work_area.width;
     let anchor_is_left = anchor_center.0 < midpoint_twice;
     let mut eligible = HashSet::new();
-    for id in candidate_ids {
-        let geometry = geometries.get(id)?;
+    for member in candidates {
+        let geometry = geometries.get(&member.id)?;
         let center = WindowRect::from_physical(geometry.position, geometry.size).center_twice();
         if monitor.contains_center_twice(center) && (center.0 < midpoint_twice) == anchor_is_left {
-            eligible.insert(id.clone());
+            eligible.insert(member.clone());
         }
     }
     visual_order(&eligible, geometries)
+}
+
+fn durable_relink_order(
+    parent: &StoredGroupMember,
+    active_order: &[StoredGroupMember],
+    absorbed_groups: &[StoredGroup],
+) -> Vec<StoredGroupMember> {
+    let active_members: HashSet<_> = active_order.iter().cloned().collect();
+    let mut inactive_before: HashMap<StoredGroupMember, Vec<StoredGroupMember>> = HashMap::new();
+    let mut inactive_after: HashMap<StoredGroupMember, Vec<StoredGroupMember>> = HashMap::new();
+
+    for group in absorbed_groups {
+        let Some(first_active) = group
+            .members
+            .iter()
+            .find(|member| active_members.contains(*member))
+            .cloned()
+        else {
+            continue;
+        };
+        let mut previous_active = None;
+        for member in &group.members {
+            if active_members.contains(member) {
+                previous_active = Some(member.clone());
+            } else if let Some(active) = &previous_active {
+                inactive_after
+                    .entry(active.clone())
+                    .or_default()
+                    .push(member.clone());
+            } else {
+                inactive_before
+                    .entry(first_active.clone())
+                    .or_default()
+                    .push(member.clone());
+            }
+        }
+    }
+
+    let mut durable_order = Vec::new();
+    for active in active_order {
+        if active == parent {
+            durable_order.push(active.clone());
+            durable_order.extend(inactive_before.remove(active).unwrap_or_default());
+        } else {
+            durable_order.extend(inactive_before.remove(active).unwrap_or_default());
+            durable_order.push(active.clone());
+        }
+        durable_order.extend(inactive_after.remove(active).unwrap_or_default());
+    }
+    durable_order
+}
+
+fn persist_relinked_group(
+    store: &mut crate::save_load::NoteStore,
+    absorbed_group_ids: &HashSet<String>,
+    group_id: &str,
+    members: &[StoredGroupMember],
+) {
+    for absorbed_group_id in absorbed_group_ids {
+        store.groups.remove(absorbed_group_id);
+    }
+    store.groups.insert(
+        group_id.to_string(),
+        StoredGroup {
+            id: group_id.to_string(),
+            members: members.to_vec(),
+        },
+    );
 }
 
 fn arranged_positions(
@@ -208,11 +291,173 @@ fn arranged_positions(
         .collect()
 }
 
-fn durable_note_height(note: &StoredNote) -> u32 {
-    if note.collapsed {
-        COLLAPSED_HEIGHT
-    } else {
-        note.expanded_height.max(80)
+#[derive(Debug, Clone)]
+enum StoredSurface {
+    Note(StoredNote),
+    Timer(StoredTimer),
+}
+
+impl StoredSurface {
+    fn member(&self) -> StoredGroupMember {
+        match self {
+            Self::Note(note) => StoredGroupMember::note(&note.id),
+            Self::Timer(timer) => StoredGroupMember::timer(&timer.id),
+        }
+    }
+
+    fn x(&self) -> i32 {
+        match self {
+            Self::Note(note) => note.x,
+            Self::Timer(timer) => timer.x,
+        }
+    }
+
+    fn y(&self) -> i32 {
+        match self {
+            Self::Note(note) => note.y,
+            Self::Timer(timer) => timer.y,
+        }
+    }
+
+    fn collapsed(&self) -> bool {
+        match self {
+            Self::Note(note) => note.collapsed,
+            Self::Timer(timer) => timer.collapsed,
+        }
+    }
+
+    fn pinned(&self) -> bool {
+        match self {
+            Self::Note(note) => note.pinned,
+            Self::Timer(timer) => timer.pinned,
+        }
+    }
+
+    fn width(&self) -> u32 {
+        match self {
+            Self::Note(note) => note.expanded_width.max(150),
+            Self::Timer(_) => TIMER_WIDTH,
+        }
+    }
+
+    fn expanded_height(&self) -> u32 {
+        match self {
+            Self::Note(note) => note.expanded_height.max(80),
+            Self::Timer(_) => TIMER_HEIGHT,
+        }
+    }
+
+    fn durable_height(&self) -> u32 {
+        if self.collapsed() {
+            COLLAPSED_HEIGHT
+        } else {
+            self.expanded_height()
+        }
+    }
+
+    fn set_position(&mut self, x: i32, y: i32) {
+        match self {
+            Self::Note(note) => {
+                note.x = x;
+                note.y = y;
+            }
+            Self::Timer(timer) => {
+                timer.x = x;
+                timer.y = y;
+            }
+        }
+    }
+
+    fn set_collapsed_and_size(&mut self, collapsed: bool, size: LogicalSize<u32>) {
+        match self {
+            Self::Note(note) => {
+                if collapsed {
+                    note.expanded_width = size.width.max(150);
+                } else if !note.collapsed {
+                    note.expanded_width = size.width.max(150);
+                    note.expanded_height = size.height.max(80);
+                }
+                note.collapsed = collapsed;
+            }
+            Self::Timer(timer) => timer.collapsed = collapsed,
+        }
+    }
+}
+
+fn stored_surface(app: &AppHandle, member: &StoredGroupMember) -> anyhow::Result<StoredSurface> {
+    match member.kind {
+        GroupMemberKind::Note => app
+            .state::<NoteRepository>()
+            .get(&member.id)
+            .map(StoredSurface::Note),
+        GroupMemberKind::Timer => app
+            .state::<TimerRepository>()
+            .get(&member.id)
+            .map(StoredSurface::Timer),
+    }
+}
+
+fn replace_surface_batch(app: &AppHandle, surfaces: &[StoredSurface]) -> anyhow::Result<()> {
+    let notes = surfaces
+        .iter()
+        .filter_map(|surface| match surface {
+            StoredSurface::Note(note) => Some(note.clone()),
+            StoredSurface::Timer(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let timers = surfaces
+        .iter()
+        .filter_map(|surface| match surface {
+            StoredSurface::Note(_) => None,
+            StoredSurface::Timer(timer) => Some(timer.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    if !timers.is_empty() {
+        app.state::<TimerRepository>().mutate(|stored| {
+            for replacement in &timers {
+                *stored.get_mut(&replacement.id).with_context(|| {
+                    format!("Cannot replace missing timer {}", replacement.id)
+                })? = replacement.clone();
+            }
+            Ok(())
+        })?;
+    }
+    if !notes.is_empty() {
+        app.state::<NoteRepository>().mutate(|store| {
+            for replacement in &notes {
+                *store
+                    .notes
+                    .get_mut(&replacement.id)
+                    .with_context(|| format!("Cannot replace missing note {}", replacement.id))? =
+                    replacement.clone();
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+fn persist_surface_changes(
+    app: &AppHandle,
+    replacements: &[StoredSurface],
+) -> anyhow::Result<Vec<StoredSurface>> {
+    let mut originals = Vec::with_capacity(replacements.len());
+    for replacement in replacements {
+        originals.push(stored_surface(app, &replacement.member())?);
+    }
+    if let Err(error) = replace_surface_batch(app, replacements) {
+        if let Err(rollback) = replace_surface_batch(app, &originals) {
+            log::error!("Could not roll back durable linked-window geometry: {rollback:#}");
+        }
+        return Err(error);
+    }
+    Ok(originals)
+}
+
+fn restore_surface_changes(app: &AppHandle, originals: &[StoredSurface]) {
+    if let Err(error) = replace_surface_batch(app, originals) {
+        log::error!("Could not roll back durable linked-window state: {error:#}");
     }
 }
 
@@ -275,42 +520,61 @@ fn position_settlement(
     }
 }
 
-fn active_group_ids(
+fn active_group_members(
+    app: &AppHandle,
     repository: &NoteRepository,
     group: &StoredGroup,
-    excluded: &HashSet<String>,
-) -> anyhow::Result<Vec<String>> {
-    let active: HashSet<_> = repository
+    excluded: &HashSet<StoredGroupMember>,
+) -> anyhow::Result<Vec<StoredGroupMember>> {
+    let active_notes: HashSet<_> = repository
         .active()?
         .into_iter()
         .map(|note| note.id)
         .collect();
+    let timer_repository = app.state::<TimerRepository>();
+    let active_timers: HashSet<_> = if timer_repository.is_available() {
+        timer_repository
+            .all()?
+            .into_iter()
+            .filter(|timer| {
+                app.get_webview_window(&format!("timer_{}", timer.id))
+                    .is_some()
+            })
+            .map(|timer| timer.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     Ok(group
-        .note_ids
+        .members
         .iter()
-        .filter(|id| active.contains(*id) && !excluded.contains(*id))
+        .filter(|member| {
+            let active = match member.kind {
+                GroupMemberKind::Note => active_notes.contains(&member.id),
+                GroupMemberKind::Timer => active_timers.contains(&member.id),
+            };
+            active && !excluded.contains(*member)
+        })
         .cloned()
         .collect())
 }
 
-fn layout_for_ids_at_origin(
+fn layout_for_members_at_origin(
     app: &AppHandle,
-    ids: &[String],
+    members: &[StoredGroupMember],
     origin_override: Option<LogicalPosition<i32>>,
 ) -> anyhow::Result<GroupLayout> {
-    let snapshots = snapshots_for_ids(app, ids)?;
+    let snapshots = snapshots_for_members(app, members)?;
     let first = snapshots.first().context("Group had no active members")?;
     let origin = origin_override.unwrap_or(
         first
             .position
             .to_logical::<i32>(first.window.scale_factor()?),
     );
-    let repository = app.state::<NoteRepository>();
     let heights = snapshots
         .iter()
         .map(|snapshot| {
-            let note = repository.get(&snapshot.id)?;
-            Ok(durable_note_height(&note))
+            stored_surface(app, &snapshot.member).map(|surface| surface.durable_height())
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let targets = arranged_positions(origin, &heights)?;
@@ -324,24 +588,30 @@ fn restore_snapshots(
 ) {
     for snapshot in snapshots {
         if let Err(error) = snapshot.window.set_size(snapshot.size) {
-            log::error!("Could not restore note {} size: {error}", snapshot.id);
+            log::error!(
+                "Could not restore window {:?} size: {error}",
+                snapshot.member
+            );
         }
         let position_restored = if let Err(error) = snapshot.window.set_position(snapshot.position)
         {
-            log::error!("Could not restore note {} position: {error}", snapshot.id);
+            log::error!(
+                "Could not restore window {:?} position: {error}",
+                snapshot.member
+            );
             false
         } else {
             true
         };
         let _ = geometries.insert(
-            snapshot.id.clone(),
+            snapshot.member.id.clone(),
             NoteGeometry {
                 position: snapshot.position,
                 size: snapshot.size,
             },
         );
         if position_restored {
-            runtime.record_programmatic_position(snapshot.id.clone(), snapshot.position);
+            runtime.record_programmatic_position(snapshot.member.runtime_key(), snapshot.position);
         }
     }
 }
@@ -359,38 +629,40 @@ fn apply_layout(
         if current != *target {
             if let Err(error) = snapshot.window.set_position(*target) {
                 restore_snapshots(&layout.snapshots[..index], geometries, runtime);
-                return Err(error)
-                    .with_context(|| format!("Could not position group member {}", snapshot.id));
+                return Err(error).with_context(|| {
+                    format!("Could not position group member {:?}", snapshot.member)
+                });
             }
         }
-        if let Err(error) = geometries.set_position(&snapshot.id, requested) {
+        if let Err(error) = geometries.set_position(&snapshot.member.id, requested) {
             restore_snapshots(&layout.snapshots[..=index], geometries, runtime);
             return Err(error)
-                .with_context(|| format!("Could not cache group member {}", snapshot.id));
+                .with_context(|| format!("Could not cache group member {:?}", snapshot.member));
         }
         if current != *target {
-            runtime.record_programmatic_position(snapshot.id.clone(), requested);
+            runtime.record_programmatic_position(snapshot.member.runtime_key(), requested);
         }
     }
     Ok(())
 }
 
-fn persist_layout_positions(
-    store: &mut crate::save_load::NoteStore,
+fn layout_surface_replacements(
+    app: &AppHandle,
     layout: &GroupLayout,
-) -> anyhow::Result<()> {
-    for (snapshot, target) in layout.snapshots.iter().zip(&layout.targets) {
-        let note = store
-            .notes
-            .get_mut(&snapshot.id)
-            .with_context(|| format!("Cannot position missing group member {}", snapshot.id))?;
-        note.x = target.x;
-        note.y = target.y;
-    }
-    Ok(())
+) -> anyhow::Result<Vec<StoredSurface>> {
+    layout
+        .snapshots
+        .iter()
+        .zip(&layout.targets)
+        .map(|(snapshot, target)| {
+            let mut surface = stored_surface(app, &snapshot.member)?;
+            surface.set_position(target.x, target.y);
+            Ok(surface)
+        })
+        .collect()
 }
 
-pub fn link_notes_on_this_side_below(
+pub fn link_windows_on_this_side_below(
     app: &AppHandle,
     parent: &WebviewWindow,
 ) -> anyhow::Result<()> {
@@ -399,107 +671,123 @@ pub fn link_notes_on_this_side_below(
     open_missing_active_notes(app)?;
     let repository = app.state::<NoteRepository>();
     let geometries = app.state::<GeometryIndex>();
-    let parent_id = note_id_from_label(parent.label())?.to_string();
-    let existing_group = repository.group_for_note(&parent_id)?;
-    let existing_group_ids: HashSet<_> = existing_group
-        .as_ref()
-        .map(|group| group.note_ids.iter().cloned().collect())
-        .unwrap_or_default();
-    let grouped_ids: HashSet<_> = repository
-        .all_groups()?
-        .into_iter()
-        .flat_map(|group| group.note_ids)
-        .collect();
-    let independent_ids: Vec<_> = repository
+    let parent_member = StoredGroupMember::from_window_label(parent.label())?;
+    let groups = repository.all_groups()?;
+    let existing_group = groups
+        .iter()
+        .find(|group| group.members.contains(&parent_member))
+        .cloned();
+    let mut active_members: Vec<_> = repository
         .active()?
         .into_iter()
-        .map(|note| note.id)
-        .filter(|id| !grouped_ids.contains(id) && id != &parent_id)
+        .map(|note| StoredGroupMember::note(note.id))
         .collect();
+    let timer_repository = app.state::<TimerRepository>();
+    if timer_repository.is_available() {
+        active_members.extend(
+            timer_repository
+                .all()?
+                .into_iter()
+                .filter(|timer| {
+                    app.get_webview_window(&format!("timer_{}", timer.id))
+                        .is_some()
+                })
+                .map(|timer| StoredGroupMember::timer(timer.id)),
+        );
+    }
+    let globally_active: HashSet<_> = active_members.iter().cloned().collect();
+    active_members.retain(|member| member != &parent_member);
     let monitor = parent
         .current_monitor()?
         .context("Selected parent did not have a current monitor")?;
     let monitor_rect = WindowRect::from_physical(*monitor.position(), *monitor.size());
     let work_area =
         WindowRect::from_physical(monitor.work_area().position, monitor.work_area().size);
-    let eligible_independent = ids_on_anchor_monitor_side(
-        &parent_id,
-        &independent_ids,
+    let eligible_active = members_on_anchor_monitor_side(
+        &parent_member,
+        &active_members,
         &geometries,
         monitor_rect,
         work_area,
     )?;
-    let active_ids: HashSet<_> = repository
-        .active()?
+    let mut selected_members: HashSet<_> = eligible_active.into_iter().collect();
+    selected_members.insert(parent_member.clone());
+    let absorbed_groups = groups
         .into_iter()
-        .map(|note| note.id)
-        .collect();
-    let mut other_ids: HashSet<_> = eligible_independent.into_iter().collect();
-    other_ids.extend(
-        existing_group_ids
-            .iter()
-            .filter(|id| active_ids.contains(*id) && *id != &parent_id)
-            .cloned(),
-    );
-    let mut order = vec![parent_id.clone()];
-    order.extend(visual_order(&other_ids, &geometries)?);
+        .filter(|group| {
+            group
+                .members
+                .iter()
+                .any(|member| selected_members.contains(member))
+        })
+        .collect::<Vec<_>>();
+    let mut other_members = selected_members;
+    for group in &absorbed_groups {
+        other_members.extend(
+            group
+                .members
+                .iter()
+                .filter(|member| globally_active.contains(*member))
+                .cloned(),
+        );
+    }
+    other_members.remove(&parent_member);
+    let mut order = vec![parent_member.clone()];
+    order.extend(visual_order(&other_members, &geometries)?);
     if order.len() < 2 {
-        bail!("No independent notes are available to link on this monitor side");
+        bail!("No other active windows are available to link on this monitor side");
     }
 
-    let parent_geometry = geometries.get(&parent_id)?;
+    let parent_geometry = geometries.get(&parent_member.id)?;
     let parent_origin = parent_geometry
         .position
         .to_logical::<i32>(parent.scale_factor()?);
-    let layout = layout_for_ids_at_origin(app, &order, Some(parent_origin))?;
+    let layout = layout_for_members_at_origin(app, &order, Some(parent_origin))?;
     apply_layout(&layout, &geometries, &mut runtime)?;
+    let replacements = layout_surface_replacements(app, &layout)?;
+    let originals = match persist_surface_changes(app, &replacements) {
+        Ok(originals) => originals,
+        Err(error) => {
+            restore_snapshots(&layout.snapshots, &geometries, &mut runtime);
+            return Err(error.context("Could not persist linked window positions"));
+        }
+    };
 
     let group_id = existing_group
         .as_ref()
         .map(|group| group.id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let mut durable_order = order.clone();
-    if let Some(group) = &existing_group {
-        durable_order.extend(
-            group
-                .note_ids
-                .iter()
-                .filter(|id| !active_ids.contains(*id))
-                .cloned(),
-        );
-    }
+    let absorbed_group_ids = absorbed_groups
+        .iter()
+        .map(|group| group.id.clone())
+        .collect::<HashSet<_>>();
+    let durable_order = durable_relink_order(&parent_member, &order, &absorbed_groups);
     let persist = repository.mutate(|store| {
-        persist_layout_positions(store, &layout)?;
-        store.groups.insert(
-            group_id.clone(),
-            StoredGroup {
-                id: group_id.clone(),
-                note_ids: durable_order.clone(),
-            },
-        );
+        persist_relinked_group(store, &absorbed_group_ids, &group_id, &durable_order);
         Ok(())
     });
     if let Err(error) = persist {
+        restore_surface_changes(app, &originals);
         restore_snapshots(&layout.snapshots, &geometries, &mut runtime);
         return Err(error.context("Could not persist linked group"));
     }
     Ok(())
 }
 
-pub fn link_notes_on_this_side_below_focused(app: &AppHandle) -> anyhow::Result<()> {
-    let parent = get_focused_window(app).context("No note currently focused")?;
-    link_notes_on_this_side_below(app, &parent)
+pub fn link_windows_on_this_side_below_focused(app: &AppHandle) -> anyhow::Result<()> {
+    let parent = get_focused_window(app).context("No note or timer is currently focused")?;
+    link_windows_on_this_side_below(app, &parent)
 }
 
 pub fn unlink_group_for_focused(app: &AppHandle) -> anyhow::Result<()> {
     let runtime_state = app.state::<GroupRuntime>();
     let _runtime = runtime_state.lock()?;
-    let window = get_focused_window(app).context("No note currently focused")?;
-    let id = note_id_from_label(window.label())?;
+    let window = get_focused_window(app).context("No note or timer is currently focused")?;
+    let member = StoredGroupMember::from_window_label(window.label())?;
     let repository = app.state::<NoteRepository>();
     let group = repository
-        .group_for_note(id)?
-        .context("The focused note is not in a linked group")?;
+        .group_for_member(&member)?
+        .context("The focused window is not in a linked group")?;
     repository.mutate(|store| {
         store.groups.remove(&group.id);
         Ok(())
@@ -508,18 +796,14 @@ pub fn unlink_group_for_focused(app: &AppHandle) -> anyhow::Result<()> {
 
 fn restore_stored_geometry(
     window: &WebviewWindow,
-    note: &StoredNote,
+    surface: &StoredSurface,
     geometries: &GeometryIndex,
     runtime: &mut GroupRuntimeState,
 ) {
+    let member = surface.member();
     let result = (|| -> anyhow::Result<()> {
-        let height = if note.collapsed {
-            COLLAPSED_HEIGHT
-        } else {
-            note.expanded_height.max(80)
-        };
-        let requested_size = LogicalSize::new(note.expanded_width.max(150), height);
-        let requested_position = LogicalPosition::new(note.x, note.y);
+        let requested_size = LogicalSize::new(surface.width(), surface.durable_height());
+        let requested_position = LogicalPosition::new(surface.x(), surface.y());
         window.set_size(requested_size)?;
         window.set_position(requested_position)?;
         let scale = window.scale_factor()?;
@@ -527,38 +811,26 @@ fn restore_stored_geometry(
             position: requested_position.to_physical(scale),
             size: requested_size.to_physical(scale),
         };
-        geometries.insert(note.id.clone(), geometry)?;
-        runtime.record_programmatic_position(note.id.clone(), geometry.position);
+        geometries.insert(member.id.clone(), geometry)?;
+        runtime.record_programmatic_position(member.runtime_key(), geometry.position);
         Ok(())
     })();
     if let Err(error) = result {
-        log::error!("Could not restore note {} geometry: {error:#}", note.id);
+        log::error!("Could not restore window {:?} geometry: {error:#}", member);
     }
 }
 
 fn persist_group_detachment(
     store: &mut crate::save_load::NoteStore,
     group_id: &str,
-    id: &str,
-    position: LogicalPosition<i32>,
-    size: LogicalSize<u32>,
+    member: &StoredGroupMember,
 ) -> anyhow::Result<()> {
-    let note = store
-        .notes
-        .get_mut(id)
-        .with_context(|| format!("Cannot detach missing note {id}"))?;
-    note.x = position.x;
-    note.y = position.y;
-    if !note.collapsed {
-        note.expanded_width = size.width.max(150);
-        note.expanded_height = size.height.max(80);
-    }
     let stored_group = store
         .groups
         .get_mut(group_id)
         .with_context(|| format!("Cannot detach from missing group {group_id}"))?;
-    stored_group.note_ids.retain(|member| member != id);
-    if stored_group.note_ids.len() < 2 {
+    stored_group.members.retain(|candidate| candidate != member);
+    if stored_group.members.len() < 2 {
         store.groups.remove(group_id);
     }
     Ok(())
@@ -571,16 +843,26 @@ fn detach_member(
     runtime: &mut GroupRuntimeState,
 ) -> anyhow::Result<()> {
     let app = window.app_handle();
-    let id = note_id_from_label(window.label())?.to_string();
+    let member = StoredGroupMember::from_window_label(window.label())?;
     let repository = app.state::<NoteRepository>();
     let geometries = app.state::<GeometryIndex>();
-    let previous = repository.get(&id)?;
+    let previous = stored_surface(app, &member)?;
     let scale = window.scale_factor()?;
     let position = geometry.position.to_logical::<i32>(scale);
     let size = geometry.size.to_logical::<u32>(scale);
-    let persist =
-        repository.mutate(|store| persist_group_detachment(store, &group.id, &id, position, size));
-    if let Err(error) = persist {
+    let mut replacement = previous.clone();
+    replacement.set_position(position.x, position.y);
+    if let StoredSurface::Note(note) = &mut replacement {
+        if !note.collapsed {
+            note.expanded_width = size.width.max(150);
+            note.expanded_height = size.height.max(80);
+        }
+    }
+    let originals = persist_surface_changes(app, &[replacement])?;
+    if let Err(error) =
+        repository.mutate(|store| persist_group_detachment(store, &group.id, &member))
+    {
+        restore_surface_changes(app, &originals);
         restore_stored_geometry(window, &previous, &geometries, runtime);
         return Err(error.context("Could not persist group detachment"));
     }
@@ -598,61 +880,52 @@ where
     let app = window.app_handle();
     let runtime_state = app.state::<GroupRuntime>();
     let mut runtime = runtime_state.lock()?;
-    let id = note_id_from_label(window.label())?.to_string();
-    let origin = app.state::<GeometryIndex>().get(&id)?.position;
-    runtime.begin_user_drag(id.clone(), origin);
+    let member = StoredGroupMember::from_window_label(window.label())?;
+    let key = member.runtime_key();
+    let origin = app.state::<GeometryIndex>().get(&member.id)?.position;
+    runtime.begin_user_drag(key.clone(), origin);
     if let Err(error) = drag() {
-        runtime.cancel_user_drag(&id);
+        runtime.cancel_user_drag(&key);
         return Err(error);
     }
-    runtime.complete_user_drag(&id)
+    runtime.complete_user_drag(&key)
 }
 
 fn resize_group_member(
     window: &WebviewWindow,
     group: &StoredGroup,
-    old_note: &StoredNote,
+    old_surface: &StoredSurface,
     target_size: LogicalSize<u32>,
     collapsed: Option<bool>,
     runtime: &mut GroupRuntimeState,
 ) -> anyhow::Result<()> {
     let app = window.app_handle();
-    let id = note_id_from_label(window.label())?.to_string();
+    let member = StoredGroupMember::from_window_label(window.label())?;
     let repository = app.state::<NoteRepository>();
     let geometries = app.state::<GeometryIndex>();
-    let active_ids = active_group_ids(&repository, group, &HashSet::new())?;
-    let index = active_ids
+    let active_members = active_group_members(app, &repository, group, &HashSet::new())?;
+    let index = active_members
         .iter()
-        .position(|member| member == &id)
-        .context("Group did not contain the resized active note")?;
-    let selected_geometry = geometries.get(&id)?;
+        .position(|candidate| candidate == &member)
+        .context("Group did not contain the resized active window")?;
+    let selected_geometry = geometries.get(&member.id)?;
     let scale = window.scale_factor()?;
-    let previous_logical_size = LogicalSize::new(
-        old_note.expanded_width.max(150),
-        if old_note.collapsed {
-            COLLAPSED_HEIGHT
-        } else {
-            old_note.expanded_height.max(80)
-        },
-    );
+    let previous_logical_size = LogicalSize::new(old_surface.width(), old_surface.durable_height());
     let selected_snapshot = WindowSnapshot {
-        id: id.clone(),
+        member: member.clone(),
         window: window.clone(),
         position: selected_geometry.position,
         size: previous_logical_size.to_physical(scale),
     };
-    let old_size = previous_logical_size;
-    let later_snapshots = snapshots_for_ids(app, &active_ids[index + 1..])?;
+    let later_snapshots = snapshots_for_members(app, &active_members[index + 1..])?;
     let later_heights = later_snapshots
         .iter()
         .map(|snapshot| {
-            repository
-                .get(&snapshot.id)
-                .map(|note| durable_note_height(&note))
+            stored_surface(app, &snapshot.member).map(|surface| surface.durable_height())
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let targets = positions_after_changed_note(
-        LogicalPosition::new(old_note.x, old_note.y),
+        LogicalPosition::new(old_surface.x(), old_surface.y()),
         target_size.height,
         &later_heights,
     )?;
@@ -662,15 +935,15 @@ fn resize_group_member(
             window.unmaximize()?;
         }
         if let Some(collapsed) = collapsed {
-            window.set_resizable(!collapsed)?;
+            window.set_resizable(member.kind == GroupMemberKind::Note && !collapsed)?;
         }
         window.set_size(target_size)?;
-        geometries.set_size(&id, target_size.to_physical(scale))?;
+        geometries.set_size(&member.id, target_size.to_physical(scale))?;
         for (snapshot, target) in later_snapshots.iter().zip(&targets) {
             snapshot.window.set_position(*target)?;
             let requested = requested_physical_position(snapshot, *target)?;
-            geometries.set_position(&snapshot.id, requested)?;
-            runtime.record_programmatic_position(snapshot.id.clone(), requested);
+            geometries.set_position(&snapshot.member.id, requested)?;
+            runtime.record_programmatic_position(snapshot.member.runtime_key(), requested);
         }
         Ok(())
     })();
@@ -681,43 +954,38 @@ fn resize_group_member(
             &geometries,
             runtime,
         );
-        let _ = window.set_resizable(!old_note.collapsed);
+        let _ =
+            window.set_resizable(member.kind == GroupMemberKind::Note && !old_surface.collapsed());
         return Err(error.context("Could not resize linked group member"));
     }
 
-    let persist = repository.mutate(|store| {
-        let note = store
-            .notes
-            .get_mut(&id)
-            .with_context(|| format!("Cannot resize missing note {id}"))?;
-        if collapsed == Some(true) {
-            note.expanded_width = old_size.width.max(150);
-            note.expanded_height = old_size.height.max(80);
-        } else if collapsed != Some(false) || !old_note.collapsed {
+    let mut replacements = Vec::with_capacity(later_snapshots.len() + 1);
+    let mut selected = old_surface.clone();
+    match (&mut selected, collapsed) {
+        (StoredSurface::Note(note), None) if !note.collapsed => {
             note.expanded_width = target_size.width.max(150);
             note.expanded_height = target_size.height.max(80);
         }
-        if let Some(collapsed) = collapsed {
-            note.collapsed = collapsed;
+        (surface, Some(collapsed)) => {
+            surface.set_collapsed_and_size(collapsed, previous_logical_size)
         }
-        for (snapshot, target) in later_snapshots.iter().zip(&targets) {
-            let later = store
-                .notes
-                .get_mut(&snapshot.id)
-                .with_context(|| format!("Cannot reflow missing group member {}", snapshot.id))?;
-            later.x = target.x;
-            later.y = target.y;
-        }
-        Ok(())
-    });
-    if let Err(error) = persist {
+        _ => {}
+    }
+    replacements.push(selected);
+    for (snapshot, target) in later_snapshots.iter().zip(&targets) {
+        let mut later = stored_surface(app, &snapshot.member)?;
+        later.set_position(target.x, target.y);
+        replacements.push(later);
+    }
+    if let Err(error) = persist_surface_changes(app, &replacements) {
         restore_snapshots(&later_snapshots, &geometries, runtime);
         restore_snapshots(
             std::slice::from_ref(&selected_snapshot),
             &geometries,
             runtime,
         );
-        let _ = window.set_resizable(!old_note.collapsed);
+        let _ =
+            window.set_resizable(member.kind == GroupMemberKind::Note && !old_surface.collapsed());
         return Err(error.context("Could not persist linked group resize"));
     }
     Ok(())
@@ -729,26 +997,26 @@ fn set_group_member_collapsed(
     runtime: &mut GroupRuntimeState,
 ) -> anyhow::Result<()> {
     let app = window.app_handle();
-    let id = note_id_from_label(window.label())?;
+    let member = StoredGroupMember::from_window_label(window.label())?;
     let repository = app.state::<NoteRepository>();
-    let current = repository.get(id)?;
-    if current.collapsed == collapsed {
+    let current = stored_surface(app, &member)?;
+    if current.collapsed() == collapsed {
         return Ok(());
     }
     let group = repository
-        .group_for_note(id)?
-        .context("Note was no longer in a linked group")?;
+        .group_for_member(&member)?
+        .context("Window was no longer in a linked group")?;
     let current_size = app
         .state::<GeometryIndex>()
-        .get(id)?
+        .get(&member.id)?
         .size
         .to_logical::<u32>(window.scale_factor()?);
     let target = LogicalSize::new(
-        current_size.width.max(150),
+        current.width().max(current_size.width),
         if collapsed {
             COLLAPSED_HEIGHT
         } else {
-            current.expanded_height.max(80)
+            current.expanded_height()
         },
     );
     resize_group_member(window, &group, &current, target, Some(collapsed), runtime)?;
@@ -762,11 +1030,17 @@ pub fn set_window_collapsed(window: &WebviewWindow, collapsed: bool) -> anyhow::
     let app = window.app_handle();
     let runtime_state = app.state::<GroupRuntime>();
     let mut runtime = runtime_state.lock()?;
-    let id = note_id_from_label(window.label())?;
-    if app.state::<NoteRepository>().group_for_note(id)?.is_some() {
+    let member = StoredGroupMember::from_window_label(window.label())?;
+    if app
+        .state::<NoteRepository>()
+        .group_for_member(&member)?
+        .is_some()
+    {
         set_group_member_collapsed(window, collapsed, &mut runtime)
-    } else {
+    } else if member.kind == GroupMemberKind::Note {
         set_ungrouped_window_collapsed(window, collapsed)
+    } else {
+        set_ungrouped_timer_collapsed(window, collapsed)
     }
 }
 
@@ -784,10 +1058,17 @@ pub fn resize_note_height(window: &WebviewWindow, height: u32) -> anyhow::Result
     let size = geometry.size.to_logical::<u32>(window.scale_factor()?);
     let target = LogicalSize::new(size.width.max(150), height.max(80));
     if let Some(group) = repository.group_for_note(id)? {
-        resize_group_member(window, &group, &current, target, None, &mut runtime)
+        resize_group_member(
+            window,
+            &group,
+            &StoredSurface::Note(current),
+            target,
+            None,
+            &mut runtime,
+        )
     } else {
         let snapshot = WindowSnapshot {
-            id: id.to_string(),
+            member: StoredGroupMember::note(id),
             window: window.clone(),
             position: geometry.position,
             size: geometry.size,
@@ -814,19 +1095,20 @@ pub fn settle_window_geometry(window: &WebviewWindow) -> anyhow::Result<()> {
     let app = window.app_handle();
     let runtime_state = app.state::<GroupRuntime>();
     let mut runtime = runtime_state.lock()?;
-    let id = note_id_from_label(window.label())?.to_string();
-    if runtime.drag_origins.contains_key(&id) {
+    let member = StoredGroupMember::from_window_label(window.label())?;
+    let key = member.runtime_key();
+    if runtime.drag_origins.contains_key(&key) {
         return Ok(());
     }
     let geometries = app.state::<GeometryIndex>();
-    let geometry = geometries.get(&id)?;
+    let geometry = geometries.get(&member.id)?;
     let scale = window.scale_factor()?;
     let position = geometry.position.to_logical::<i32>(scale);
     let size = geometry.size.to_logical::<u32>(scale);
     let repository = app.state::<NoteRepository>();
-    let current = repository.get(&id)?;
-    let group = repository.group_for_note(&id)?;
-    if let Some(origin) = runtime.take_completed_drag(&id) {
+    let current = stored_surface(app, &member)?;
+    let group = repository.group_for_member(&member)?;
+    if let Some(origin) = runtime.take_completed_drag(&key) {
         let start = origin.to_logical::<i32>(scale);
         let end = geometry.position.to_logical::<i32>(scale);
         if let Some(group) = &group {
@@ -835,55 +1117,67 @@ pub fn settle_window_geometry(window: &WebviewWindow) -> anyhow::Result<()> {
             }
             if geometry.position != origin {
                 window.set_position(origin)?;
-                geometries.set_position(&id, origin)?;
-                runtime.record_programmatic_position(id.clone(), origin);
+                geometries.set_position(&member.id, origin)?;
+                runtime.record_programmatic_position(key.clone(), origin);
             }
         } else {
-            repository.update_geometry_if_changed(
-                &id,
-                position.x,
-                position.y,
-                size.width,
-                size.height,
-            )?;
+            let mut replacement = current.clone();
+            replacement.set_position(position.x, position.y);
+            if let StoredSurface::Note(note) = &mut replacement {
+                if !note.collapsed {
+                    note.expanded_width = size.width.max(150);
+                    note.expanded_height = size.height.max(80);
+                }
+            }
+            persist_surface_changes(app, &[replacement])?;
             return Ok(());
         }
     } else {
         match position_settlement(
             &mut runtime.programmatic_positions,
-            &id,
+            &key,
             geometry.position,
-            LogicalPosition::new(current.x, current.y),
+            LogicalPosition::new(current.x(), current.y()),
             scale,
         ) {
             PositionSettlement::AdoptProgrammatic(observed) => {
-                if position.x != current.x || position.y != current.y {
-                    repository.update(&id, |note| {
-                        note.x = position.x;
-                        note.y = position.y;
-                        Ok(())
-                    })?;
+                if position.x != current.x() || position.y != current.y() {
+                    let mut replacement = current.clone();
+                    replacement.set_position(position.x, position.y);
+                    persist_surface_changes(app, &[replacement])?;
                 }
-                geometries.set_position(&id, observed)?;
+                geometries.set_position(&member.id, observed)?;
             }
             PositionSettlement::ExternalMove => {
-                if current.pinned {
-                    window.set_position(LogicalPosition::new(current.x, current.y))?;
-                    let requested = LogicalPosition::new(current.x, current.y).to_physical(scale);
-                    geometries.set_position(&id, requested)?;
-                    runtime.record_programmatic_position(id.clone(), requested);
+                if current.pinned() {
+                    window.set_position(LogicalPosition::new(current.x(), current.y()))?;
+                    let requested =
+                        LogicalPosition::new(current.x(), current.y()).to_physical(scale);
+                    geometries.set_position(&member.id, requested)?;
+                    runtime.record_programmatic_position(key.clone(), requested);
                 }
             }
             PositionSettlement::Unchanged => {}
         }
     }
     if group.is_none() {
-        repository.update_size_if_changed(&id, size.width, size.height)?;
+        if let StoredSurface::Note(note) = current {
+            if !note.collapsed
+                && (size.width != note.expanded_width || size.height != note.expanded_height)
+            {
+                let mut replacement = StoredSurface::Note(note);
+                if let StoredSurface::Note(note) = &mut replacement {
+                    note.expanded_width = size.width.max(150);
+                    note.expanded_height = size.height.max(80);
+                }
+                persist_surface_changes(app, &[replacement])?;
+            }
+        }
         return Ok(());
     }
-    let group = group.context("Note was no longer in a linked group")?;
-    if current.collapsed
-        || (size.width == current.expanded_width && size.height == current.expanded_height)
+    let group = group.context("Window was no longer in a linked group")?;
+    if current.collapsed()
+        || (size.width == current.width() && size.height == current.expanded_height())
     {
         return Ok(());
     }
@@ -905,16 +1199,20 @@ fn close_group_member(
     let id = note_id_from_label(window.label())?.to_string();
     let repository = app.state::<NoteRepository>();
     let previous = repository.get(&id)?;
+    let member = StoredGroupMember::note(&id);
     let group = repository
         .group_for_note(&id)?
         .context("Note was no longer in a linked group")?;
-    let active_before = active_group_ids(&repository, &group, &HashSet::new())?;
-    let removed_top = active_before.first().is_some_and(|member| member == &id);
-    let remaining = active_group_ids(&repository, &group, &HashSet::from([id.clone()]))?;
+    let active_before = active_group_members(app, &repository, &group, &HashSet::new())?;
+    let removed_top = active_before
+        .first()
+        .is_some_and(|candidate| candidate == &member);
+    let remaining =
+        active_group_members(app, &repository, &group, &HashSet::from([member.clone()]))?;
     let layout = if remaining.is_empty() {
         None
     } else {
-        Some(layout_for_ids_at_origin(
+        Some(layout_for_members_at_origin(
             app,
             &remaining,
             removed_top.then_some(LogicalPosition::new(previous.x, previous.y)),
@@ -923,43 +1221,37 @@ fn close_group_member(
     if let Some(layout) = &layout {
         apply_layout(layout, &app.state::<GeometryIndex>(), runtime)?;
     }
-    let closed_at = current_time_millis()?;
-    if let Err(error) = repository.mutate(|store| {
-        store
-            .notes
-            .get_mut(&id)
-            .with_context(|| format!("Cannot archive missing note {id}"))?
-            .closed_at = Some(closed_at);
-        if let Some(layout) = &layout {
-            persist_layout_positions(store, layout)?;
+    let replacements = layout
+        .as_ref()
+        .map(|layout| layout_surface_replacements(app, layout))
+        .transpose()?
+        .unwrap_or_default();
+    let originals = match persist_surface_changes(app, &replacements) {
+        Ok(originals) => originals,
+        Err(error) => {
+            if let Some(layout) = &layout {
+                restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
+            }
+            return Err(error.context("Could not persist linked group compaction"));
         }
+    };
+    let closed_at = current_time_millis()?;
+    if let Err(error) = repository.update(&id, |note| {
+        note.closed_at = Some(closed_at);
         Ok(())
     }) {
+        restore_surface_changes(app, &originals);
         if let Some(layout) = &layout {
             restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
         }
         return Err(error.context("Could not archive linked group member"));
     }
     if let Err(close_error) = window.close() {
-        let rollback = repository.mutate(|store| {
-            *store
-                .notes
-                .get_mut(&id)
-                .with_context(|| format!("Cannot restore missing note {id}"))? = previous.clone();
-            if let Some(layout) = &layout {
-                for snapshot in &layout.snapshots {
-                    let note = store.notes.get_mut(&snapshot.id).with_context(|| {
-                        format!("Cannot restore missing group member {}", snapshot.id)
-                    })?;
-                    let logical = snapshot
-                        .position
-                        .to_logical::<i32>(snapshot.window.scale_factor()?);
-                    note.x = logical.x;
-                    note.y = logical.y;
-                }
-            }
+        let rollback = repository.update(&id, |note| {
+            *note = previous.clone();
             Ok(())
         });
+        restore_surface_changes(app, &originals);
         if let Some(layout) = &layout {
             restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
         }
@@ -968,21 +1260,106 @@ fn close_group_member(
         })?;
         return Err(close_error.into());
     }
-    runtime.drag_origins.remove(&id);
-    runtime.completed_drag_origins.remove(&id);
-    runtime.programmatic_positions.remove(&id);
+    let key = member.runtime_key();
+    runtime.drag_origins.remove(&key);
+    runtime.completed_drag_origins.remove(&key);
+    runtime.programmatic_positions.remove(&key);
     Ok(())
 }
 
-pub fn close_window_and_archive(window: &WebviewWindow) -> anyhow::Result<()> {
+fn close_grouped_timer(
+    window: &WebviewWindow,
+    runtime: &mut GroupRuntimeState,
+) -> anyhow::Result<()> {
+    let app = window.app_handle();
+    let member = StoredGroupMember::from_window_label(window.label())?;
+    let repository = app.state::<NoteRepository>();
+    let group = repository
+        .group_for_member(&member)?
+        .context("Timer was no longer in a linked group")?;
+    let previous_group = group.clone();
+    let previous_timer = stored_surface(app, &member)?;
+    let active_before = active_group_members(app, &repository, &group, &HashSet::new())?;
+    let removed_top = active_before
+        .first()
+        .is_some_and(|candidate| candidate == &member);
+    let remaining =
+        active_group_members(app, &repository, &group, &HashSet::from([member.clone()]))?;
+    let layout = if remaining.is_empty() {
+        None
+    } else {
+        Some(layout_for_members_at_origin(
+            app,
+            &remaining,
+            removed_top.then_some(LogicalPosition::new(previous_timer.x(), previous_timer.y())),
+        )?)
+    };
+    if let Some(layout) = &layout {
+        apply_layout(layout, &app.state::<GeometryIndex>(), runtime)?;
+    }
+    let replacements = layout
+        .as_ref()
+        .map(|layout| layout_surface_replacements(app, layout))
+        .transpose()?
+        .unwrap_or_default();
+    let originals = persist_surface_changes(app, &replacements)?;
+    if let Err(error) =
+        repository.mutate(|store| persist_group_detachment(store, &group.id, &member))
+    {
+        restore_surface_changes(app, &originals);
+        if let Some(layout) = &layout {
+            restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
+        }
+        return Err(error.context("Could not remove timer from linked group"));
+    }
+    let removed_timer = match remove_timer_for_close(window) {
+        Ok(timer) => timer,
+        Err(error) => {
+            let _ = repository.mutate(|store| {
+                store
+                    .groups
+                    .insert(previous_group.id.clone(), previous_group.clone());
+                Ok(())
+            });
+            restore_surface_changes(app, &originals);
+            if let Some(layout) = &layout {
+                restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
+            }
+            return Err(error.context("Could not delete linked timer"));
+        }
+    };
+    if let Err(close_error) = window.close() {
+        restore_timer_after_failed_close(window, removed_timer)?;
+        repository.mutate(|store| {
+            store
+                .groups
+                .insert(previous_group.id.clone(), previous_group.clone());
+            Ok(())
+        })?;
+        restore_surface_changes(app, &originals);
+        if let Some(layout) = &layout {
+            restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
+        }
+        return Err(close_error.into());
+    }
+    let key = member.runtime_key();
+    runtime.drag_origins.remove(&key);
+    runtime.completed_drag_origins.remove(&key);
+    runtime.programmatic_positions.remove(&key);
+    Ok(())
+}
+
+pub fn close_window(window: &WebviewWindow) -> anyhow::Result<()> {
     let app = window.app_handle();
     let runtime_state = app.state::<GroupRuntime>();
     let mut runtime = runtime_state.lock()?;
-    let id = note_id_from_label(window.label())?;
-    if app.state::<NoteRepository>().group_for_note(id)?.is_some() {
-        close_group_member(window, &mut runtime)
-    } else {
-        close_ungrouped_window_and_archive(window)
+    let member = StoredGroupMember::from_window_label(window.label())?;
+    let group = app.state::<NoteRepository>().group_for_member(&member)?;
+    match (member.kind, group.is_some()) {
+        (GroupMemberKind::Note, true) => close_group_member(window, &mut runtime),
+        (GroupMemberKind::Note, false) => close_ungrouped_window_and_archive(window),
+        (GroupMemberKind::Timer, true) => close_grouped_timer(window, &mut runtime),
+        (GroupMemberKind::Timer, false) => close_timer(window.clone()).map_err(anyhow::Error::msg),
     }
 }
 
@@ -998,37 +1375,54 @@ fn restore_archived_note(
         let layout = group
             .as_ref()
             .map(|group| {
-                let mut active: HashSet<_> = repository
+                let mut active_notes: HashSet<_> = repository
                     .active()?
                     .into_iter()
                     .map(|active_note| active_note.id)
                     .collect();
-                active.insert(note.id.clone());
-                let ids: Vec<_> = group
-                    .note_ids
+                active_notes.insert(note.id.clone());
+                let timers = app.state::<TimerRepository>();
+                let active_timers: HashSet<_> = if timers.is_available() {
+                    timers
+                        .all()?
+                        .into_iter()
+                        .filter(|timer| {
+                            app.get_webview_window(&format!("timer_{}", timer.id))
+                                .is_some()
+                        })
+                        .map(|timer| timer.id)
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+                let members: Vec<_> = group
+                    .members
                     .iter()
-                    .filter(|id| active.contains(*id))
+                    .filter(|member| match member.kind {
+                        GroupMemberKind::Note => active_notes.contains(&member.id),
+                        GroupMemberKind::Timer => active_timers.contains(&member.id),
+                    })
                     .cloned()
                     .collect();
-                layout_for_ids_at_origin(app, &ids, None).map(Some)
+                layout_for_members_at_origin(app, &members, None).map(Some)
             })
             .transpose()?
             .flatten();
         if let Some(layout) = &layout {
             apply_layout(layout, &app.state::<GeometryIndex>(), runtime)?;
         }
-        let persist = repository.mutate(|store| {
-            store
-                .notes
-                .get_mut(&note.id)
-                .with_context(|| format!("Cannot restore missing note {}", note.id))?
-                .closed_at = None;
-            if let Some(layout) = &layout {
-                persist_layout_positions(store, layout)?;
-            }
+        let replacements = layout
+            .as_ref()
+            .map(|layout| layout_surface_replacements(app, layout))
+            .transpose()?
+            .unwrap_or_default();
+        let originals = persist_surface_changes(app, &replacements)?;
+        let persist = repository.update(&note.id, |stored| {
+            stored.closed_at = None;
             Ok(())
         });
         if let Err(error) = persist {
+            restore_surface_changes(app, &originals);
             if let Some(layout) = &layout {
                 restore_snapshots(&layout.snapshots, &app.state::<GeometryIndex>(), runtime);
             }
@@ -1122,7 +1516,7 @@ pub fn reset_note_positions(app: &AppHandle) -> anyhow::Result<()> {
             let id = note_id_from_label(window.label())?.to_string();
             let geometry = geometries.get(&id)?;
             Ok(WindowSnapshot {
-                id,
+                member: StoredGroupMember::note(id),
                 window,
                 position: geometry.position,
                 size: geometry.size,
@@ -1152,15 +1546,15 @@ pub fn reset_note_positions(app: &AppHandle) -> anyhow::Result<()> {
             restore_snapshots(&snapshots[..index], &geometries, &mut runtime);
             return Err(error.into());
         }
-        geometries.set_position(&snapshot.id, *target)?;
-        runtime.record_programmatic_position(snapshot.id.clone(), *target);
+        geometries.set_position(&snapshot.member.id, *target)?;
+        runtime.record_programmatic_position(snapshot.member.runtime_key(), *target);
     }
     let positions = snapshots
         .iter()
         .zip(&targets)
         .map(|(snapshot, target)| {
             let logical = target.to_logical::<i32>(snapshot.window.scale_factor()?);
-            Ok((snapshot.id.clone(), logical.x, logical.y))
+            Ok((snapshot.member.id.clone(), logical.x, logical.y))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let persist = app.state::<NoteRepository>().mutate(|store| {
@@ -1192,9 +1586,9 @@ pub fn restore_group_layouts(app: &AppHandle) -> anyhow::Result<()> {
     let geometries = app.state::<GeometryIndex>();
     let mut layouts = Vec::new();
     for group in repository.all_groups()? {
-        let ids = active_group_ids(&repository, &group, &HashSet::new())?;
-        if !ids.is_empty() {
-            layouts.push(layout_for_ids_at_origin(app, &ids, None)?);
+        let members = active_group_members(app, &repository, &group, &HashSet::new())?;
+        if !members.is_empty() {
+            layouts.push(layout_for_members_at_origin(app, &members, None)?);
         }
     }
     if layouts.is_empty() {
@@ -1208,13 +1602,14 @@ pub fn restore_group_layouts(app: &AppHandle) -> anyhow::Result<()> {
             return Err(error.context("Could not restore linked group layouts"));
         }
     }
-    let persist = repository.mutate(|store| {
-        for layout in &layouts {
-            persist_layout_positions(store, layout)?;
-        }
-        Ok(())
-    });
-    if let Err(error) = persist {
+    let replacements = layouts
+        .iter()
+        .map(|layout| layout_surface_replacements(app, layout))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if let Err(error) = persist_surface_changes(app, &replacements) {
         for layout in &layouts {
             restore_snapshots(&layout.snapshots, &geometries, &mut runtime);
         }
@@ -1235,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn one_click_linking_selects_only_independent_notes_on_the_parent_side() {
+    fn one_click_linking_selects_typed_windows_only_on_the_parent_side() {
         let geometries = GeometryIndex::default();
         for (id, note_geometry) in [
             ("parent", geometry(100, 100, 280, 100)),
@@ -1244,6 +1639,7 @@ mod tests {
             ("top-left", geometry(100, 20, 180, 100)),
             ("other-side", geometry(700, 10, 300, 100)),
             ("other-monitor", geometry(1100, 0, 300, 100)),
+            ("timer", geometry(160, 180, 300, 176)),
         ] {
             geometries.insert(id.into(), note_geometry).unwrap();
         }
@@ -1253,18 +1649,109 @@ mod tests {
             width: 1000,
             height: 800,
         };
-        let ids = [
-            "top-right",
-            "bottom",
-            "top-left",
-            "other-side",
-            "other-monitor",
-        ]
-        .map(str::to_string);
+        let members = vec![
+            StoredGroupMember::note("top-right"),
+            StoredGroupMember::note("bottom"),
+            StoredGroupMember::note("top-left"),
+            StoredGroupMember::note("other-side"),
+            StoredGroupMember::note("other-monitor"),
+            StoredGroupMember::timer("timer"),
+        ];
 
         assert_eq!(
-            ids_on_anchor_monitor_side("parent", &ids, &geometries, monitor, monitor).unwrap(),
-            vec!["top-left", "top-right", "bottom"]
+            members_on_anchor_monitor_side(
+                &StoredGroupMember::note("parent"),
+                &members,
+                &geometries,
+                monitor,
+                monitor,
+            )
+            .unwrap(),
+            vec![
+                StoredGroupMember::note("top-left"),
+                StoredGroupMember::note("top-right"),
+                StoredGroupMember::note("bottom"),
+                StoredGroupMember::timer("timer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn relinking_from_an_independent_parent_absorbs_a_mixed_group_and_preserves_slots() {
+        let parent = StoredGroupMember::note("parent");
+        let dump = StoredGroupMember::note("dump");
+        let archived = StoredGroupMember::note("archived");
+        let timer = StoredGroupMember::timer("timer");
+        let absorbed_group = StoredGroup {
+            id: "lower".into(),
+            members: vec![dump.clone(), archived.clone(), timer.clone()],
+        };
+        let durable_order = durable_relink_order(
+            &parent,
+            &[parent.clone(), dump.clone(), timer.clone()],
+            std::slice::from_ref(&absorbed_group),
+        );
+        let mut store: crate::save_load::NoteStore = serde_json::from_value(serde_json::json!({
+            "version": 4,
+            "notes": {
+                "parent": {
+                    "id": "parent", "document": {"type": "doc", "content": []},
+                    "color": "#fff9b1", "x": 20, "y": 20,
+                    "expanded_height": 250, "expanded_width": 300,
+                    "collapsed": false, "pinned": false, "font_size": 16
+                },
+                "dump": {
+                    "id": "dump", "document": {"type": "doc", "content": []},
+                    "color": "#fff9b1", "x": 20, "y": 282,
+                    "expanded_height": 250, "expanded_width": 300,
+                    "collapsed": false, "pinned": false, "font_size": 16
+                },
+                "archived": {
+                    "id": "archived", "document": {"type": "doc", "content": []},
+                    "color": "#fff9b1", "x": 20, "y": 544,
+                    "expanded_height": 250, "expanded_width": 300,
+                    "collapsed": true, "pinned": false, "font_size": 16,
+                    "closed_at": 1
+                },
+                "other": {
+                    "id": "other", "document": {"type": "doc", "content": []},
+                    "color": "#fff9b1", "x": 900, "y": 20,
+                    "expanded_height": 250, "expanded_width": 300,
+                    "collapsed": false, "pinned": false, "font_size": 16
+                }
+            },
+            "groups": {
+                "lower": {"id": "lower", "members": [
+                    {"kind": "note", "id": "dump"},
+                    {"kind": "note", "id": "archived"},
+                    {"kind": "timer", "id": "timer"}
+                ]},
+                "other-side": {"id": "other-side", "members": [
+                    {"kind": "note", "id": "other"},
+                    {"kind": "timer", "id": "other-timer"}
+                ]}
+            }
+        }))
+        .unwrap();
+
+        persist_relinked_group(
+            &mut store,
+            &HashSet::from([absorbed_group.id]),
+            "relinked",
+            &durable_order,
+        );
+
+        assert_eq!(
+            store.groups["relinked"].members,
+            [parent, dump, archived, timer]
+        );
+        assert!(!store.groups.contains_key("lower"));
+        assert_eq!(
+            store.groups["other-side"].members,
+            [
+                StoredGroupMember::note("other"),
+                StoredGroupMember::timer("other-timer"),
+            ]
         );
     }
 
@@ -1289,6 +1776,33 @@ mod tests {
         assert_eq!(
             positions_after_changed_note(LogicalPosition::new(40, 282), 24, &[250, 24]).unwrap(),
             vec![LogicalPosition::new(40, 318), LogicalPosition::new(40, 580),]
+        );
+    }
+
+    #[test]
+    fn folding_a_timer_reflows_only_later_mixed_members() {
+        assert_eq!(
+            positions_after_changed_note(LogicalPosition::new(40, 282), 24, &[250, 176]).unwrap(),
+            vec![LogicalPosition::new(40, 318), LogicalPosition::new(40, 580),]
+        );
+    }
+
+    #[test]
+    fn deleting_a_timer_compacts_remaining_windows_without_changing_order() {
+        let members = [
+            (StoredGroupMember::note("first"), 250),
+            (StoredGroupMember::timer("deleted"), 176),
+            (StoredGroupMember::note("last"), 250),
+        ];
+        let remaining_heights = members
+            .iter()
+            .filter(|(member, _)| member != &StoredGroupMember::timer("deleted"))
+            .map(|(_, height)| *height)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arranged_positions(LogicalPosition::new(40, 20), &remaining_heights).unwrap(),
+            vec![LogicalPosition::new(40, 20), LogicalPosition::new(40, 282)]
         );
     }
 
@@ -1361,9 +1875,9 @@ mod tests {
     }
 
     #[test]
-    fn dragging_a_group_member_detaches_only_that_note() {
+    fn dragging_a_typed_group_member_removes_only_that_membership() {
         let mut store: crate::save_load::NoteStore = serde_json::from_value(serde_json::json!({
-            "version": 3,
+            "version": 4,
             "notes": {
                 "first": {
                     "id": "first", "document": {"type": "doc", "content": []},
@@ -1385,27 +1899,27 @@ mod tests {
                 }
             },
             "groups": {
-                "group": {"id": "group", "note_ids": ["first", "dragged", "last"]}
+                "group": {"id": "group", "members": [
+                    {"kind": "note", "id": "first"},
+                    {"kind": "timer", "id": "dragged"},
+                    {"kind": "note", "id": "last"}
+                ]}
             }
         }))
         .unwrap();
 
-        persist_group_detachment(
-            &mut store,
-            "group",
-            "dragged",
-            LogicalPosition::new(400, 300),
-            LogicalSize::new(300, 250),
-        )
-        .unwrap();
+        persist_group_detachment(&mut store, "group", &StoredGroupMember::timer("dragged"))
+            .unwrap();
 
         assert_eq!((store.notes["first"].x, store.notes["first"].y), (20, 20));
         assert_eq!((store.notes["last"].x, store.notes["last"].y), (20, 544));
         assert_eq!(
-            (store.notes["dragged"].x, store.notes["dragged"].y),
-            (400, 300)
+            store.groups["group"].members,
+            [
+                StoredGroupMember::note("first"),
+                StoredGroupMember::note("last"),
+            ]
         );
-        assert_eq!(store.groups["group"].note_ids, ["first", "last"]);
     }
 
     #[test]

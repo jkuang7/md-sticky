@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal local UI capability for sticky-note windows",
-  "windows": ["sticky_*"],
+  "description": "Minimal local UI capability for sticky note and timer windows",
+  "windows": ["sticky_*", "timer_*"],
   "platforms": ["macOS"],
   "permissions": [
     "core:event:allow-listen",
