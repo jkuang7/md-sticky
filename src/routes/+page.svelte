@@ -131,7 +131,6 @@
 
   async function setColor(color: string) {
     document.body.style.backgroundColor = color;
-    colorMenuOpen = false;
     await editor?.flushSave();
   }
 
