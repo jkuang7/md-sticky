@@ -115,10 +115,6 @@
     await save;
   }
 
-  export function removeSelection() {
-    editor?.commands.blur();
-  }
-
   export function focus() {
     editor?.commands.focus();
   }

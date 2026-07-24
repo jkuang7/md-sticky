@@ -223,7 +223,9 @@
       await appWindow.listen("tauri://blur", async () => {
         titlebarHovered = false;
         document.body.classList.remove("focused");
-        editor?.removeSelection();
+        // Keep the editor as the window's paste target while another app is
+        // active. Dictation tools such as VoiceInk temporarily leave Sticky
+        // and then deliver their transcript by sending Command+V.
         await editor?.flushSave();
       }),
       await appWindow.listen<number>("set_color", async (event) => {
