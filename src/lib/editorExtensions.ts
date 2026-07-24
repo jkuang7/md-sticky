@@ -1,8 +1,19 @@
 import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { Extension, type Editor, type JSONContent } from "@tiptap/core";
-import { Fragment } from "@tiptap/pm/model";
-import { Selection, TextSelection } from "@tiptap/pm/state";
+import {
+  Fragment,
+  type Node as ProseMirrorNode,
+  type NodeType,
+  type ResolvedPos,
+} from "@tiptap/pm/model";
+import {
+  AllSelection,
+  Selection,
+  TextSelection,
+  type EditorState,
+  type Transaction,
+} from "@tiptap/pm/state";
 import { canJoin } from "@tiptap/pm/transform";
 import { StarterKit } from "@tiptap/starter-kit";
 
@@ -42,6 +53,396 @@ function activeListItemType(
     if (type === "listItem" || type === "taskItem") return type;
   }
   return undefined;
+}
+
+const topLevelListTypes = new Set([
+  "bulletList",
+  "orderedList",
+  "taskList",
+]);
+
+function exitTrailingNestedEmptyListItem(
+  editor: Editor,
+  itemDepth: number,
+): boolean {
+  const { $from } = editor.state.selection;
+  let topLevelListDepth: number | undefined;
+
+  for (let depth = 1; depth < itemDepth; depth += 1) {
+    if (
+      $from.node(depth - 1).type.name === "doc" &&
+      topLevelListTypes.has($from.node(depth).type.name)
+    ) {
+      topLevelListDepth = depth;
+      break;
+    }
+  }
+
+  if (
+    topLevelListDepth === undefined ||
+    itemDepth === topLevelListDepth + 1
+  ) {
+    return false;
+  }
+
+  for (let depth = topLevelListDepth; depth <= itemDepth; depth += 1) {
+    if ($from.index(depth) !== $from.node(depth).childCount - 1) {
+      return false;
+    }
+  }
+
+  const listDepth = itemDepth - 1;
+  const deleteDepth =
+    $from.node(listDepth).childCount === 1 ? listDepth : itemDepth;
+  const deleteStart = $from.before(deleteDepth);
+  const deleteEnd = $from.after(deleteDepth);
+  const topLevelListEnd = $from.after(topLevelListDepth);
+  const paragraph = editor.schema.nodes.paragraph;
+  if (!paragraph) return false;
+
+  return editor.commands.command(({ tr }) => {
+    tr.delete(deleteStart, deleteEnd);
+    const paragraphPosition = tr.mapping.map(topLevelListEnd);
+    tr.insert(paragraphPosition, paragraph.create());
+    tr.setSelection(
+      TextSelection.create(tr.doc, paragraphPosition + 1),
+    );
+    tr.scrollIntoView();
+    return true;
+  });
+}
+
+export function liftEmptyListItemOnly(editor: Editor): boolean {
+  const { selection } = editor.state;
+  const { $from } = selection;
+  if (
+    !selection.empty ||
+    $from.parent.type.name !== "paragraph" ||
+    $from.parent.content.size !== 0
+  ) {
+    return false;
+  }
+
+  for (let depth = $from.depth - 1; depth > 0; depth -= 1) {
+    const item = $from.node(depth);
+    if (item.type.name !== "listItem" && item.type.name !== "taskItem") {
+      continue;
+    }
+    if (
+      item.childCount !== 1 ||
+      item.firstChild !== $from.parent ||
+      $from.index(depth) !== 0
+    ) {
+      return false;
+    }
+    if (exitTrailingNestedEmptyListItem(editor, depth)) return true;
+    return editor.commands.liftListItem(item.type.name);
+  }
+
+  return false;
+}
+
+export function deleteEmptyParagraphAfterList(
+  state: EditorState,
+  dispatch: ((transaction: Transaction) => void) | undefined,
+): boolean {
+  const { selection } = state;
+  const { $from } = selection;
+  if (
+    !selection.empty ||
+    $from.depth !== 1 ||
+    $from.parent.type.name !== "paragraph" ||
+    $from.parent.content.size !== 0
+  ) {
+    return false;
+  }
+
+  const paragraphIndex = $from.index(0);
+  if (
+    paragraphIndex === 0 ||
+    !topLevelListTypes.has(state.doc.child(paragraphIndex - 1).type.name)
+  ) {
+    return false;
+  }
+
+  const previousText = Selection.findFrom(
+    state.doc.resolve($from.before()),
+    -1,
+    true,
+  );
+  if (!(previousText instanceof TextSelection)) return false;
+  if (!dispatch) return true;
+
+  const transaction = state.tr.delete($from.before(), $from.after());
+  transaction.setSelection(
+    TextSelection.create(transaction.doc, previousText.from),
+  );
+  dispatch(transaction.scrollIntoView());
+  return true;
+}
+
+type ConvertibleListType = "bulletList" | "taskList";
+
+function convertibleListItemAt(
+  $position: ResolvedPos,
+): ProseMirrorNode | undefined {
+  for (let depth = $position.depth; depth > 1; depth -= 1) {
+    const item = $position.node(depth);
+    const list = $position.node(depth - 1);
+    if (
+      (item.type.name === "listItem" &&
+        list.type.name === "bulletList") ||
+      (item.type.name === "taskItem" &&
+        list.type.name === "taskList")
+    ) {
+      return item;
+    }
+  }
+  return undefined;
+}
+
+function selectedConvertibleItems(
+  state: EditorState,
+): Set<ProseMirrorNode> {
+  const { doc, selection } = state;
+  const selected = new Set<ProseMirrorNode>();
+
+  if (selection.empty) {
+    const item = convertibleListItemAt(selection.$from);
+    if (item) selected.add(item);
+    return selected;
+  }
+
+  doc.descendants((node, position) => {
+    if (!node.isTextblock) return true;
+
+    const contentStart = position + 1;
+    const contentEnd = contentStart + node.content.size;
+    const touches =
+      node.content.size === 0
+        ? selection.from <= contentStart && selection.to > contentStart
+        : selection.from < contentEnd && selection.to > contentStart;
+    if (!touches) return false;
+
+    const item = convertibleListItemAt(
+      doc.resolve(Math.min(contentStart, doc.content.size)),
+    );
+    if (item) selected.add(item);
+    return false;
+  });
+
+  return selected;
+}
+
+function sameChildren(
+  node: ProseMirrorNode,
+  children: ProseMirrorNode[],
+): boolean {
+  return (
+    node.childCount === children.length &&
+    children.every((child, index) => node.child(index) === child)
+  );
+}
+
+function transformListNode(
+  node: ProseMirrorNode,
+  selected: Set<ProseMirrorNode>,
+  targetListName: ConvertibleListType,
+  targetListType: NodeType,
+  targetItemType: NodeType,
+): ProseMirrorNode[] {
+  const output: ProseMirrorNode[] = [];
+  let segmentType: NodeType | undefined;
+  let segmentAttrs: ProseMirrorNode["attrs"] | undefined;
+  let segmentItems: ProseMirrorNode[] = [];
+
+  const flushSegment = () => {
+    if (!segmentType || segmentItems.length === 0) return;
+    output.push(
+      segmentType.create(
+        segmentAttrs,
+        Fragment.fromArray(segmentItems),
+      ),
+    );
+    segmentType = undefined;
+    segmentAttrs = undefined;
+    segmentItems = [];
+  };
+
+  node.forEach((item) => {
+    const transformedChildren = transformChildren(
+      item,
+      selected,
+      targetListName,
+      targetListType,
+      targetItemType,
+    );
+    const isSelected = selected.has(item);
+
+    const desiredListType = isSelected ? targetListType : node.type;
+    const alreadyTargetType = isSelected && node.type.name === targetListName;
+    const desiredItem = alreadyTargetType
+      ? sameChildren(item, transformedChildren)
+        ? item
+        : item.copy(Fragment.fromArray(transformedChildren))
+      : isSelected
+        ? targetItemType.create(
+            null,
+            Fragment.fromArray(transformedChildren),
+            item.marks,
+          )
+        : sameChildren(item, transformedChildren)
+          ? item
+          : item.copy(Fragment.fromArray(transformedChildren));
+
+    if (segmentType !== desiredListType) {
+      flushSegment();
+      segmentType = desiredListType;
+      segmentAttrs = desiredListType === node.type ? node.attrs : undefined;
+    }
+    segmentItems.push(desiredItem);
+  });
+
+  flushSegment();
+  return output;
+}
+
+function transformChildren(
+  node: ProseMirrorNode,
+  selected: Set<ProseMirrorNode>,
+  targetListName: ConvertibleListType,
+  targetListType: NodeType,
+  targetItemType: NodeType,
+): ProseMirrorNode[] {
+  const children: ProseMirrorNode[] = [];
+  node.forEach((child) => {
+    children.push(
+      ...transformNode(
+        child,
+        selected,
+        targetListName,
+        targetListType,
+        targetItemType,
+      ),
+    );
+  });
+  return children;
+}
+
+function transformNode(
+  node: ProseMirrorNode,
+  selected: Set<ProseMirrorNode>,
+  targetListName: ConvertibleListType,
+  targetListType: NodeType,
+  targetItemType: NodeType,
+): ProseMirrorNode[] {
+  if (
+    node.type.name === "bulletList" ||
+    node.type.name === "taskList"
+  ) {
+    return transformListNode(
+      node,
+      selected,
+      targetListName,
+      targetListType,
+      targetItemType,
+    );
+  }
+  if (node.isTextblock || node.isLeaf) return [node];
+
+  const children = transformChildren(
+    node,
+    selected,
+    targetListName,
+    targetListType,
+    targetItemType,
+  );
+  return [
+    sameChildren(node, children)
+      ? node
+      : node.copy(Fragment.fromArray(children)),
+  ];
+}
+
+function mappedTextPosition(
+  doc: ProseMirrorNode,
+  originalParent: ProseMirrorNode,
+  parentOffset: number,
+): number | undefined {
+  let mapped: number | undefined;
+  doc.descendants((node, position) => {
+    if (node !== originalParent) return mapped === undefined;
+    mapped = position + 1 + parentOffset;
+    return false;
+  });
+  return mapped;
+}
+
+export function transformSelectedListItems(
+  state: EditorState,
+  dispatch: ((transaction: Transaction) => void) | undefined,
+  targetListName: ConvertibleListType,
+): boolean {
+  const selected = selectedConvertibleItems(state);
+  if (selected.size === 0) return false;
+
+  const targetListType = state.schema.nodes[targetListName];
+  const targetItemType = state.schema.nodes[
+    targetListName === "taskList" ? "taskItem" : "listItem"
+  ];
+  if (!targetListType || !targetItemType) return false;
+
+  const transformedContent = transformChildren(
+    state.doc,
+    selected,
+    targetListName,
+    targetListType,
+    targetItemType,
+  );
+  const transformedDoc = state.doc.type.create(
+    state.doc.attrs,
+    Fragment.fromArray(transformedContent),
+    state.doc.marks,
+  );
+  if (!dispatch) return true;
+
+  const diffStart = state.doc.content.findDiffStart(
+    transformedDoc.content,
+  );
+  const diffEnd = state.doc.content.findDiffEnd(
+    transformedDoc.content,
+  );
+  if (diffStart === null && diffEnd === null) return true;
+  if (diffStart === null || diffEnd === null) return false;
+
+  const { selection } = state;
+  const transaction = state.tr.replace(
+    diffStart,
+    diffEnd.a,
+    transformedDoc.slice(diffStart, diffEnd.b),
+  );
+  if (selection instanceof TextSelection) {
+    const anchor = mappedTextPosition(
+      transformedDoc,
+      selection.$anchor.parent,
+      selection.$anchor.parentOffset,
+    );
+    const head = mappedTextPosition(
+      transformedDoc,
+      selection.$head.parent,
+      selection.$head.parentOffset,
+    );
+    if (anchor !== undefined && head !== undefined) {
+      transaction.setSelection(
+        TextSelection.create(transaction.doc, anchor, head),
+      );
+    }
+  } else if (selection instanceof AllSelection) {
+    transaction.setSelection(new AllSelection(transaction.doc));
+  }
+  if (state.storedMarks) transaction.setStoredMarks(state.storedMarks);
+  dispatch(transaction.scrollIntoView());
+  return true;
 }
 
 function sinkListItemAcrossAdjacentLists(
@@ -285,6 +686,14 @@ const StickyShortcuts = Extension.create({
   priority: 1_000,
   addKeyboardShortcuts() {
     return {
+      Backspace: () => {
+        if (this.editor.commands.undoInputRule()) return true;
+        if (liftEmptyListItemOnly(this.editor)) return true;
+        return this.editor.commands.command(({ state, dispatch }) =>
+          deleteEmptyParagraphAfterList(state, dispatch),
+        );
+      },
+      Enter: () => liftEmptyListItemOnly(this.editor),
       Tab: () => {
         const itemType = activeListItemType(this.editor);
         if (itemType) {
@@ -357,7 +766,26 @@ const StickyShortcuts = Extension.create({
         // Always consume the shortcut so WebKit cannot focus titlebar controls.
         return true;
       },
-      "Mod-Shift-0": () => this.editor.commands.toggleBulletList(),
+      "Mod-Shift-0": () => {
+        if (
+          this.editor.commands.command(({ state, dispatch }) =>
+            transformSelectedListItems(state, dispatch, "bulletList"),
+          )
+        ) {
+          return true;
+        }
+        return this.editor.commands.toggleBulletList();
+      },
+      "Mod-Shift-9": () => {
+        if (
+          this.editor.commands.command(({ state, dispatch }) =>
+            transformSelectedListItems(state, dispatch, "taskList"),
+          )
+        ) {
+          return true;
+        }
+        return this.editor.commands.toggleTaskList();
+      },
       "Mod-Shift-x": () => {
         const result = removeCheckedTasks(this.editor.getJSON().content ?? []);
         if (!result.removed) return true;

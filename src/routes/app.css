@@ -94,6 +94,14 @@ button {
   padding-left: 1.45em;
 }
 
+.editor .tiptap :is(ul, ol):has(+ :is(ul, ol)) {
+  margin-bottom: 0;
+}
+
+.editor .tiptap :is(ul, ol) + :is(ul, ol) {
+  margin-top: 0;
+}
+
 .editor .tiptap ul[data-type="taskList"] {
   list-style: none;
   padding-left: 0;
